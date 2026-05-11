@@ -1,8 +1,6 @@
-# ralph
+# go-ralph-go
 
 A single-binary CLI that drives [Claude Code](https://docs.claude.com/claude-code) through a [Ralph Wiggums-style refine loop](https://ghuntley.com/ralph/) on your project — locally, against a single GitHub/GitLab issue, or as a polling worker that picks up issues labelled `ready` and ships them as merged PRs.
-
-Originally a Bash script (`ralph.sh`) tied to one project; rewritten in Go as a portable, configurable tool you can install once and use across every repo.
 
 ---
 
@@ -18,13 +16,13 @@ For each task ralph receives, it:
 
 It does this in three modes:
 
-| Command | When to use | Needs git host? |
-|---|---|---|
-| `ralph run "<prompt>"` | Ad-hoc local work; refine loop + commit | No |
-| `ralph run --pr "<prompt>"` | Ad-hoc work, open a PR, no auto-merge | Yes |
-| `ralph issue <N>` | Single issue end-to-end (PR + merge) | Yes |
-| `ralph auto` | Poll for `ready`-labelled issues and ship them | Yes |
-| `ralph auto --once` | Same, but exit after one cycle | Yes |
+| Command                     | When to use                                    | Needs git host? |
+| --------------------------- | ---------------------------------------------- | --------------- |
+| `ralph run "<prompt>"`      | Ad-hoc local work; refine loop + commit        | No              |
+| `ralph run --pr "<prompt>"` | Ad-hoc work, open a PR, no auto-merge          | Yes             |
+| `ralph issue <N>`           | Single issue end-to-end (PR + merge)           | Yes             |
+| `ralph auto`                | Poll for `ready`-labelled issues and ship them | Yes             |
+| `ralph auto --once`         | Same, but exit after one cycle                 | Yes             |
 
 Supports **GitHub** (including GitHub Enterprise) and **GitLab** (cloud and self-hosted). The provider is auto-detected from the `origin` remote.
 
@@ -45,6 +43,7 @@ go build -o ~/bin/ralph ./cmd/ralph
 ```
 
 Requirements:
+
 - **Go 1.25+** to build
 - **`claude` CLI** on `$PATH` — [install Claude Code](https://docs.claude.com/claude-code)
 - **`git`** on `$PATH`
@@ -137,7 +136,7 @@ To opt in to a project-local `CLAUDE_CONFIG_DIR` (project-scoped agents, MCP ser
 claude_config_dir = ".claude"   # absolute or relative to project root
 ```
 
-Only do this if the directory is **fully provisioned** (contains a `.credentials.json` from a real `claude /login`). A directory that exists only to hold ralph's memory files (`.claude/projects/`) is *not* a valid `CLAUDE_CONFIG_DIR` — pointing claude at it fails immediately with `Not logged in · Please run /login`. `ralph doctor` will flag this with a `[WARN]` if it spots a configured dir without credentials.
+Only do this if the directory is **fully provisioned** (contains a `.credentials.json` from a real `claude /login`). A directory that exists only to hold ralph's memory files (`.claude/projects/`) is _not_ a valid `CLAUDE_CONFIG_DIR` — pointing claude at it fails immediately with `Not logged in · Please run /login`. `ralph doctor` will flag this with a `[WARN]` if it spots a configured dir without credentials.
 
 ### CLI overrides
 
@@ -154,12 +153,12 @@ ralph auto --once                         # one cycle then exit
 
 ## Label state machine (auto / issue modes)
 
-| Label | Meaning |
-|---|---|
-| `ready` | Queued for ralph to pick up |
+| Label           | Meaning                                               |
+| --------------- | ----------------------------------------------------- |
+| `ready`         | Queued for ralph to pick up                           |
 | `ralph-working` | Currently in progress (set on claim, removed on exit) |
-| `ralph-failed` | Exited without successful merge (needs human triage) |
-| *(closed)* | PR merged; issue auto-closed via "Closes #N" |
+| `ralph-failed`  | Exited without successful merge (needs human triage)  |
+| _(closed)_      | PR merged; issue auto-closed via "Closes #N"          |
 
 Ralph creates these labels on first run (`EnsureLabels`). Rename them in the `[github.labels]` (or `[gitlab.labels]`) section if your project uses different conventions — colors and descriptions are preserved across renames.
 
@@ -167,16 +166,16 @@ Ralph creates these labels on first run (`EnsureLabels`). Rename them in the `[g
 
 ## Commands
 
-| Command | What it does |
-|---|---|
-| `ralph run "<prompt>"` | Refine loop on an ad-hoc prompt; no host required, no PR opened |
-| `ralph run --pr "<prompt>"` | Same plus open a PR (no auto-merge) |
-| `ralph issue <N>` | Single issue end-to-end: refine → PR → wait for checks → squash-merge |
-| `ralph auto` | Poll for ready issues; work them in oldest-first order, forever |
-| `ralph auto --once` | Same; exit after one issue (or immediately if nothing ready) |
-| `ralph init [--force]` | Drop a starter `.go-ralph-go` and add `.ralph/` to `.gitignore` |
-| `ralph doctor` | Probe environment: claude binary, git, remote, token, working tree |
-| `ralph version` | Print version, Go version, and platform |
+| Command                     | What it does                                                          |
+| --------------------------- | --------------------------------------------------------------------- |
+| `ralph run "<prompt>"`      | Refine loop on an ad-hoc prompt; no host required, no PR opened       |
+| `ralph run --pr "<prompt>"` | Same plus open a PR (no auto-merge)                                   |
+| `ralph issue <N>`           | Single issue end-to-end: refine → PR → wait for checks → squash-merge |
+| `ralph auto`                | Poll for ready issues; work them in oldest-first order, forever       |
+| `ralph auto --once`         | Same; exit after one issue (or immediately if nothing ready)          |
+| `ralph init [--force]`      | Drop a starter `.go-ralph-go` and add `.ralph/` to `.gitignore`       |
+| `ralph doctor`              | Probe environment: claude binary, git, remote, token, working tree    |
+| `ralph version`             | Print version, Go version, and platform                               |
 
 Every command supports `--help`.
 
@@ -186,11 +185,11 @@ Every command supports `--help`.
 
 Each run writes three files in the configured `output_dir` (default `.ralph/`):
 
-| File | Content |
-|---|---|
-| `output.jsonl` | Raw stream-json from `claude -p` — full event log, replayable |
-| `output.txt` | Pretty-rendered transcript (text deltas, `[tool: Read]`, `[tool_result]`, `[result: $X over Yms]`) |
-| `output.stderr` | Claude stderr |
+| File            | Content                                                                                            |
+| --------------- | -------------------------------------------------------------------------------------------------- |
+| `output.jsonl`  | Raw stream-json from `claude -p` — full event log, replayable                                      |
+| `output.txt`    | Pretty-rendered transcript (text deltas, `[tool: Read]`, `[tool_result]`, `[result: $X over Yms]`) |
+| `output.stderr` | Claude stderr                                                                                      |
 
 Logs are truncated at the start of each cycle (matching `ralph.sh`). For auto mode, only the most recent issue's transcript is preserved — pull historical data from the host's PR/issue history.
 
@@ -200,10 +199,10 @@ Logs are truncated at the start of each cycle (matching `ralph.sh`). For auto mo
 
 Tokens are discovered in this order:
 
-| Provider | First | Fallback |
-|---|---|---|
-| GitHub | `$GITHUB_TOKEN` | `gh auth token` |
-| GitLab | `$GITLAB_TOKEN` | `glab auth status --show-token` |
+| Provider | First           | Fallback                        |
+| -------- | --------------- | ------------------------------- |
+| GitHub   | `$GITHUB_TOKEN` | `gh auth token`                 |
+| GitLab   | `$GITLAB_TOKEN` | `glab auth status --show-token` |
 
 The `gh`/`glab` fallback means **if you're already logged in via the host CLI, ralph just works** — no extra config.
 
@@ -236,6 +235,7 @@ claude -p --verbose --output-format stream-json --include-partial-messages \
 All iterations share the same session id, so Claude's context compounds across passes — each iteration sees the prior work. The cleanup pass uses `--resume` on the same session.
 
 Stream-json events are decoded natively in Go (no `jq` dependency); the renderer mirrors the original Bash filter:
+
 - `stream_event` → text deltas streamed to terminal
 - `assistant` with `tool_use` → `[tool: Name] {input...}` (truncated at 400 chars)
 - `user` with `tool_result` → `[tool_result]`
@@ -252,7 +252,7 @@ On Ctrl+C, ralph sends Claude a polite `SIGINT` with a 10s grace period, then es
 2. **No silent runaway.** Iteration count is capped (`MaxIterations = 50`) and `poll_interval` has a 30s floor — guards against typos like `--iterations 5000`.
 3. **No premature merge.** `WaitForChecks` requires two consecutive zero-check polls before concluding "no CI configured" — gives GitHub Actions / GitLab CI time to register checks on a fresh PR.
 4. **No stuck `ralph-working` labels.** Any non-nil exit (including Ctrl+C) clears the working label via a deferred cleanup using a fresh 30s background context. After successful merge, an explicit `MarkResolved` call closes the issue + removes the working label even if Claude's PR body forgot to include `Closes #N`.
-5. **No surprise pushes in local mode.** `ralph run` without `--pr` tells Claude explicitly *not* to push or open a PR.
+5. **No surprise pushes in local mode.** `ralph run` without `--pr` tells Claude explicitly _not_ to push or open a PR.
 
 ---
 
