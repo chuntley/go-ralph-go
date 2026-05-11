@@ -1,0 +1,269 @@
+package claude
+
+import (
+	"bufio"
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sync"
+	"time"
+)
+
+// gracePeriodOnCancel is how long we let Claude clean up after SIGINT before
+// the runtime force-kills it.
+const gracePeriodOnCancel = 10 * time.Second
+
+// Session drives a single Claude conversation across multiple turns, persisting
+// stream-json output to the configured log files and rendering pretty text to
+// the caller-supplied UI writer.
+//
+// The first call to Run uses --session-id; subsequent calls use --resume so
+// Claude continues the same conversation. The original ralph.sh did the same.
+type Session struct {
+	cfg SessionConfig
+
+	id      string
+	started bool
+
+	mu sync.Mutex // guards file handles below
+	raw  *os.File // raw stream-json
+	pretty *os.File // rendered pretty text
+	stderr *os.File // claude stderr
+}
+
+type SessionConfig struct {
+	// Bin is the claude executable. Defaults to "claude".
+	Bin string
+
+	// WorkDir is the directory in which claude runs (i.e. the project root).
+	WorkDir string
+
+	// ClaudeConfigDir, if non-empty, is exported as CLAUDE_CONFIG_DIR.
+	ClaudeConfigDir string
+
+	// OutputDir is the directory for raw/pretty/stderr logs.
+	OutputDir string
+
+	// UI receives the pretty render in real time (typically os.Stdout).
+	UI io.Writer
+
+	// ExtraEnv is appended to the inherited environment.
+	ExtraEnv []string
+}
+
+// NewSession allocates a session with a generated UUID. Files are created
+// lazily on first Run so an unused session leaves no artefacts.
+func NewSession(cfg SessionConfig) (*Session, error) {
+	if cfg.Bin == "" {
+		cfg.Bin = "claude"
+	}
+	if cfg.UI == nil {
+		cfg.UI = io.Discard
+	}
+	id, err := newUUID()
+	if err != nil {
+		return nil, err
+	}
+	return &Session{cfg: cfg, id: id}, nil
+}
+
+// ID returns the generated session id.
+func (s *Session) ID() string { return s.id }
+
+// Reset truncates log files. Call between full cycles, not between turns.
+func (s *Session) Reset() error {
+	if err := s.ensureLogs(); err != nil {
+		return err
+	}
+	for _, f := range []*os.File{s.raw, s.pretty, s.stderr} {
+		if err := f.Truncate(0); err != nil {
+			return err
+		}
+		if _, err := f.Seek(0, 0); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Run executes one turn of the session against the given prompt.
+func (s *Session) Run(ctx context.Context, prompt string) error {
+	if err := s.ensureLogs(); err != nil {
+		return err
+	}
+
+	args := []string{
+		"-p",
+		"--verbose",
+		"--output-format", "stream-json",
+		"--include-partial-messages",
+	}
+	if s.started {
+		args = append(args, "--resume", s.id)
+	} else {
+		args = append(args, "--session-id", s.id)
+	}
+	args = append(args, prompt)
+
+	cmd := exec.CommandContext(ctx, s.cfg.Bin, args...)
+	cmd.Dir = s.cfg.WorkDir
+	cmd.Env = s.buildEnv()
+	cmd.Stderr = s.stderr
+	// Graceful cancellation: SIGINT then SIGKILL after grace period. Default
+	// exec.CommandContext SIGKILLs immediately, which can leave Claude state
+	// half-written.
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		return cmd.Process.Signal(os.Interrupt)
+	}
+	cmd.WaitDelay = gracePeriodOnCancel
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start claude: %w", err)
+	}
+
+	// Stream + decode + render in real time.
+	streamErr := s.consume(stdout)
+
+	if err := cmd.Wait(); err != nil {
+		// Surface claude's error but include any stream parse error context.
+		if streamErr != nil {
+			return fmt.Errorf("claude exited (%w); stream error: %v", err, streamErr)
+		}
+		return fmt.Errorf("claude exited: %w", err)
+	}
+	s.started = true
+	return streamErr
+}
+
+// WriteBanner appends a section banner to the pretty log (not the raw JSONL).
+// The runner uses this to mirror UI banners into the on-disk transcript.
+func (s *Session) WriteBanner(text string) error {
+	if err := s.ensureLogs(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pretty == nil {
+		return nil
+	}
+	_, err := s.pretty.WriteString(text)
+	return err
+}
+
+// Close flushes and closes log file handles.
+func (s *Session) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var first error
+	for _, f := range []*os.File{s.raw, s.pretty, s.stderr} {
+		if f == nil {
+			continue
+		}
+		if err := f.Close(); err != nil && first == nil {
+			first = err
+		}
+	}
+	s.raw, s.pretty, s.stderr = nil, nil, nil
+	return first
+}
+
+func (s *Session) ensureLogs() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.raw != nil {
+		return nil
+	}
+	if err := os.MkdirAll(s.cfg.OutputDir, 0o755); err != nil {
+		return err
+	}
+	var err error
+	if s.raw, err = openLog(filepath.Join(s.cfg.OutputDir, "output.jsonl")); err != nil {
+		return err
+	}
+	if s.pretty, err = openLog(filepath.Join(s.cfg.OutputDir, "output.txt")); err != nil {
+		return err
+	}
+	if s.stderr, err = openLog(filepath.Join(s.cfg.OutputDir, "output.stderr")); err != nil {
+		return err
+	}
+	return nil
+}
+
+func openLog(p string) (*os.File, error) {
+	return os.OpenFile(p, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o644)
+}
+
+func (s *Session) buildEnv() []string {
+	env := os.Environ()
+	if s.cfg.ClaudeConfigDir != "" {
+		env = append(env, "CLAUDE_CONFIG_DIR="+s.cfg.ClaudeConfigDir)
+	}
+	env = append(env, s.cfg.ExtraEnv...)
+	return env
+}
+
+// consume reads stream-json lines from r, tees raw bytes to s.raw, decodes
+// each line into an Event, renders pretty text to s.pretty and s.cfg.UI.
+//
+// Malformed lines are written to raw + skipped; they should not abort the run.
+func (s *Session) consume(r io.Reader) error {
+	scanner := bufio.NewScanner(r)
+	// Allow long lines (assistant messages with embedded base64 etc).
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if err := s.writeEvent(line); err != nil {
+			return err
+		}
+	}
+	return scanner.Err()
+}
+
+// writeEvent serialises a single decoded event to the three sinks (raw log,
+// pretty log, UI) under s.mu so a concurrent WriteBanner cannot interleave
+// half-flushed text into the pretty log.
+func (s *Session) writeEvent(line []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, err := s.raw.Write(append(append([]byte{}, line...), '\n')); err != nil {
+		return fmt.Errorf("write raw log: %w", err)
+	}
+	var ev Event
+	if err := json.Unmarshal(line, &ev); err != nil {
+		return nil // malformed JSON line: skip pretty/UI but keep raw above
+	}
+	if err := Render(s.pretty, &ev); err != nil {
+		return fmt.Errorf("write pretty log: %w", err)
+	}
+	if err := Render(s.cfg.UI, &ev); err != nil {
+		return fmt.Errorf("write ui: %w", err)
+	}
+	return nil
+}
+
+// newUUID produces a v4-ish UUID. We don't import google/uuid for one helper.
+func newUUID() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // variant 10
+	h := hex.EncodeToString(b)
+	return fmt.Sprintf("%s-%s-%s-%s-%s", h[0:8], h[8:12], h[12:16], h[16:20], h[20:32]), nil
+}
