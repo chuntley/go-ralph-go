@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 
 	"github.com/chuntley/go-ralph-go/internal/claude"
 	"github.com/chuntley/go-ralph-go/internal/config"
@@ -54,13 +55,15 @@ func runDoctor(ctx context.Context, out io.Writer) error {
 		fmt.Fprintf(out, "  [OK]   claude binary: %s\n", path)
 	}
 	if cfg.ClaudeConfigDir != "" {
-		if st, err := os.Stat(cfg.ClaudeConfigDir); err == nil && st.IsDir() {
-			fmt.Fprintf(out, "  [OK]   CLAUDE_CONFIG_DIR: %s (project-local override)\n", cfg.ClaudeConfigDir)
+		if st, err := os.Stat(cfg.ClaudeConfigDir); err != nil || !st.IsDir() {
+			fmt.Fprintf(out, "  [FAIL] CLAUDE_CONFIG_DIR: %s — directory missing\n", cfg.ClaudeConfigDir)
+		} else if _, err := os.Stat(filepath.Join(cfg.ClaudeConfigDir, ".credentials.json")); err != nil {
+			fmt.Fprintf(out, "  [WARN] CLAUDE_CONFIG_DIR: %s — no .credentials.json (claude will likely fail with 'Not logged in')\n", cfg.ClaudeConfigDir)
 		} else {
-			fmt.Fprintf(out, "  [WARN] CLAUDE_CONFIG_DIR set to %s but missing\n", cfg.ClaudeConfigDir)
+			fmt.Fprintf(out, "  [OK]   CLAUDE_CONFIG_DIR: %s (project-local override)\n", cfg.ClaudeConfigDir)
 		}
 	} else {
-		fmt.Fprintln(out, "         CLAUDE_CONFIG_DIR: (system default; add a project ./.claude to override)")
+		fmt.Fprintln(out, "         CLAUDE_CONFIG_DIR: (system-wide — default; opt in via claude_config_dir in .go-ralph-go)")
 	}
 
 	// 3. Git

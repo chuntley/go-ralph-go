@@ -48,6 +48,16 @@ func (p *Provider) Whoami(ctx context.Context) (string, error) {
 	return u.Username, nil
 }
 
+func (p *Provider) MarkRequeued(ctx context.Context, number int, l vcs.Labels) error {
+	remove := gl.LabelOptions{l.Working, l.Failed}
+	add := gl.LabelOptions{l.Ready}
+	_, _, err := p.client.Issues.UpdateIssue(p.project, int64(number), &gl.UpdateIssueOptions{
+		RemoveLabels: &remove,
+		AddLabels:    &add,
+	}, gl.WithContext(ctx))
+	return err
+}
+
 func (p *Provider) MarkResolved(ctx context.Context, number int, l vcs.Labels) error {
 	remove := gl.LabelOptions{l.Working}
 	closeEvent := "close"
@@ -169,7 +179,7 @@ func (p *Provider) FindPRForBranch(ctx context.Context, branch string) (*vcs.PR,
 	if len(mrs) == 0 {
 		return nil, nil
 	}
-	return &vcs.PR{Number: int(mrs[0].IID), Branch: branch}, nil
+	return &vcs.PR{Number: int(mrs[0].IID), Branch: branch, URL: mrs[0].WebURL}, nil
 }
 
 // minConfirmZeroPipelines is the number of consecutive polls returning a nil

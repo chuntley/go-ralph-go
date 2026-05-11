@@ -109,13 +109,31 @@ func TestLoadDiscoversConfigByWalkingUp(t *testing.T) {
 	}
 }
 
-func TestLoadAutoDetectsLocalClaudeDir(t *testing.T) {
+func TestLoadDoesNotAutoDetectLocalClaudeDir(t *testing.T) {
+	// Regression: a project-local .claude/ that exists only for memory must
+	// NOT be auto-set as CLAUDE_CONFIG_DIR. Doing so produced silent "Not
+	// logged in" failures when the dir lacked .credentials.json.
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, ConfigFileName), []byte(""), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	claudeDir := filepath.Join(root, ".claude")
-	if err := os.Mkdir(claudeDir, 0o755); err != nil {
+	if err := os.Mkdir(filepath.Join(root, ".claude"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(root)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ClaudeConfigDir != "" {
+		t.Errorf("ClaudeConfigDir must remain empty unless explicitly configured, got %q", cfg.ClaudeConfigDir)
+	}
+}
+
+func TestLoadRespectsExplicitClaudeConfigDir(t *testing.T) {
+	root := t.TempDir()
+	cfgContent := `claude_config_dir = ".claude"` + "\n"
+	if err := os.WriteFile(filepath.Join(root, ConfigFileName), []byte(cfgContent), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	t.Chdir(root)
@@ -124,6 +142,9 @@ func TestLoadAutoDetectsLocalClaudeDir(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !strings.HasSuffix(cfg.ClaudeConfigDir, ".claude") {
-		t.Errorf("expected ClaudeConfigDir to end with .claude, got %q", cfg.ClaudeConfigDir)
+		t.Errorf("expected explicit ClaudeConfigDir to be resolved, got %q", cfg.ClaudeConfigDir)
+	}
+	if !filepath.IsAbs(cfg.ClaudeConfigDir) {
+		t.Errorf("relative ClaudeConfigDir should be made absolute, got %q", cfg.ClaudeConfigDir)
 	}
 }

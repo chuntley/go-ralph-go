@@ -51,6 +51,12 @@ func (p *Provider) Whoami(ctx context.Context) (string, error) {
 	return u.GetLogin(), nil
 }
 
+func (p *Provider) MarkRequeued(ctx context.Context, number int, l vcs.Labels) error {
+	_ = p.removeLabel(ctx, number, l.Working)
+	_ = p.removeLabel(ctx, number, l.Failed)
+	return p.addLabel(ctx, number, l.Ready)
+}
+
 func (p *Provider) MarkResolved(ctx context.Context, number int, l vcs.Labels) error {
 	if err := p.removeLabel(ctx, number, l.Working); err != nil {
 		return err
@@ -192,7 +198,7 @@ func (p *Provider) FindPRForBranch(ctx context.Context, branch string) (*vcs.PR,
 	if len(prs) == 0 {
 		return nil, nil
 	}
-	return &vcs.PR{Number: prs[0].GetNumber(), Branch: branch}, nil
+	return &vcs.PR{Number: prs[0].GetNumber(), Branch: branch, URL: prs[0].GetHTMLURL()}, nil
 }
 
 // minConfirmZeroChecks is the number of consecutive polls returning zero

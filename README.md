@@ -127,13 +127,17 @@ working = "ralph-working"
 failed  = "ralph-failed"
 ```
 
-### Project-local `.claude` config
+### Project-local `.claude` config (opt-in)
 
-If a `.claude/` directory exists at your project root, ralph automatically sets `CLAUDE_CONFIG_DIR` so Claude uses project-local agents, MCP servers, skills, and credentials instead of the system-wide config. Override or disable in `.go-ralph-go`:
+By default ralph uses your **system-wide claude** install — your `claude` login carries through, no extra config needed. This is what you want 99% of the time.
+
+To opt in to a project-local `CLAUDE_CONFIG_DIR` (project-scoped agents, MCP servers, credentials), set in `.go-ralph-go`:
 
 ```toml
-claude_config_dir = "path/to/.claude"   # absolute or relative to project root
+claude_config_dir = ".claude"   # absolute or relative to project root
 ```
+
+Only do this if the directory is **fully provisioned** (contains a `.credentials.json` from a real `claude /login`). A directory that exists only to hold ralph's memory files (`.claude/projects/`) is *not* a valid `CLAUDE_CONFIG_DIR` — pointing claude at it fails immediately with `Not logged in · Please run /login`. `ralph doctor` will flag this with a `[WARN]` if it spots a configured dir without credentials.
 
 ### CLI overrides
 

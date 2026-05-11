@@ -59,9 +59,20 @@ type Config struct {
 	// ClaudeBin is the claude CLI to invoke. Default: "claude".
 	ClaudeBin string `toml:"claude_bin"`
 
-	// ClaudeConfigDir, if set, overrides the auto-detected CLAUDE_CONFIG_DIR.
-	// When empty, ralph uses ProjectRoot/.claude if it exists, otherwise lets
-	// claude use its system-wide default.
+	// ClaudeConfigDir, if set, is exported as CLAUDE_CONFIG_DIR so claude uses
+	// a project-local config directory instead of your system-wide one.
+	// When empty (the default), ralph lets claude use its system-wide config
+	// — which is almost always what you want, since system claude already
+	// holds your OAuth/login.
+	//
+	// Only set this when you have a fully-provisioned project-local
+	// .claude/ directory (credentials.json + settings + agents). A directory
+	// that exists only to hold ralph's memory files (.claude/projects/) is
+	// NOT a valid CLAUDE_CONFIG_DIR — pointing claude at it produces a
+	// "Not logged in" failure.
+	//
+	// Set to ".claude" (or any relative/absolute path) in .go-ralph-go to
+	// opt in.
 	ClaudeConfigDir string `toml:"claude_config_dir"`
 
 	// PollInterval is the seconds between polls in auto mode. Default: 300.
@@ -164,13 +175,11 @@ func Load() (*Config, error) {
 		cfg.ProjectRoot = discoverGitRoot(cwd)
 	}
 
-	// Resolve CLAUDE_CONFIG_DIR: explicit override > project-local .claude > empty.
-	if cfg.ClaudeConfigDir == "" {
-		local := filepath.Join(cfg.ProjectRoot, ".claude")
-		if isDir(local) {
-			cfg.ClaudeConfigDir = local
-		}
-	} else if !filepath.IsAbs(cfg.ClaudeConfigDir) {
+	// Resolve CLAUDE_CONFIG_DIR. Only honour an explicit setting in
+	// .go-ralph-go — never auto-detect a .claude/ directory. Auto-detection
+	// turned out to be a footgun: a memory-only .claude/ would override the
+	// system-wide claude and produce a "Not logged in" failure.
+	if cfg.ClaudeConfigDir != "" && !filepath.IsAbs(cfg.ClaudeConfigDir) {
 		cfg.ClaudeConfigDir = filepath.Join(cfg.ProjectRoot, cfg.ClaudeConfigDir)
 	}
 
@@ -283,6 +292,12 @@ const starterTOML = `# go-ralph-go project config — defaults shown, uncomment 
 # claude_bin       = "claude"
 # poll_interval    = 60           # auto-mode poll seconds (min 30)
 # default_branch   = ""           # override auto-detected default branch
+
+# Opt in to a project-local CLAUDE_CONFIG_DIR. Empty (default) = use the
+# system-wide claude install — which is almost always what you want.
+# Only set this if you have a fully-provisioned project ./.claude with
+# credentials.json (not just memory files).
+# claude_config_dir = ".claude"
 
 # refine_prompt — runs every iteration after the work prompt.
 # Placeholders: {{iter}}, {{total}}.

@@ -15,9 +15,17 @@ type Event struct {
 	// system/init
 	SessionID string `json:"session_id,omitempty"`
 
+	// assistant — top-level "error" sibling of "message" (e.g.
+	// "authentication_failed"). When set, the text content of .message is
+	// usually the human-readable reason.
+	Error string `json:"error,omitempty"`
+
 	// result
 	TotalCostUSD float64 `json:"total_cost_usd,omitempty"`
 	DurationMS   int64   `json:"duration_ms,omitempty"`
+	IsError      bool    `json:"is_error,omitempty"`
+	Result       string  `json:"result,omitempty"`
+	APIErrStatus string  `json:"api_error_status,omitempty"`
 }
 
 // streamEvent is the inner payload of an .event for stream_event Events.

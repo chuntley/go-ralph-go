@@ -26,7 +26,7 @@ func renderChunk(ev *Event) string {
 	case "stream_event":
 		return renderStream(ev.Event)
 	case "assistant":
-		return renderAssistant(ev.Message)
+		return renderAssistant(ev.Message, ev.Error)
 	case "user":
 		return renderUser(ev.Message)
 	case "system":
@@ -38,6 +38,13 @@ func renderChunk(ev *Event) string {
 			return fmt.Sprintf("[session init: %s]\n", id)
 		}
 	case "result":
+		if ev.IsError {
+			msg := ev.Result
+			if msg == "" {
+				msg = "(no error message provided)"
+			}
+			return fmt.Sprintf("\n\n[ERROR: %s]\n[result: $%g over %dms]\n\n", msg, ev.TotalCostUSD, ev.DurationMS)
+		}
 		return fmt.Sprintf("\n\n[result: $%g over %dms]\n\n", ev.TotalCostUSD, ev.DurationMS)
 	}
 	return ""
@@ -64,7 +71,11 @@ func renderStream(raw json.RawMessage) string {
 	return td.Text
 }
 
-func renderAssistant(raw json.RawMessage) string {
+// renderAssistant emits tool_use and (when the outer event carries an "error"
+// field) the consolidated text content as a flagged error line. Text content
+// in non-error assistant messages is intentionally skipped — it's already
+// being streamed via stream_event content_block_delta.
+func renderAssistant(raw json.RawMessage, outerError string) string {
 	if len(raw) == 0 {
 		return ""
 	}
@@ -74,14 +85,18 @@ func renderAssistant(raw json.RawMessage) string {
 	}
 	var b strings.Builder
 	for _, c := range msg.Content {
-		if c.Type != "tool_use" {
-			continue
+		switch c.Type {
+		case "tool_use":
+			input := string(c.Input)
+			if len(input) > toolInputMaxLen {
+				input = input[:toolInputMaxLen] + "..."
+			}
+			fmt.Fprintf(&b, "\n\n[tool: %s] %s\n", c.Name, input)
+		case "text":
+			if outerError != "" && strings.TrimSpace(c.Text) != "" {
+				fmt.Fprintf(&b, "\n[claude error (%s): %s]\n", outerError, strings.TrimSpace(c.Text))
+			}
 		}
-		input := string(c.Input)
-		if len(input) > toolInputMaxLen {
-			input = input[:toolInputMaxLen] + "..."
-		}
-		fmt.Fprintf(&b, "\n\n[tool: %s] %s\n", c.Name, input)
 	}
 	return b.String()
 }

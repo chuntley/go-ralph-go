@@ -23,6 +23,10 @@ type Issue struct {
 type PR struct {
 	Number int
 	Branch string
+	// URL is the web URL of the PR/MR (e.g. https://github.com/o/r/pull/42).
+	// Populated by FindPRForBranch so ralph can surface a clickable link in
+	// the terminal after a successful merge.
+	URL string
 }
 
 // Labels names the three labels in the ralph state machine.
@@ -57,6 +61,11 @@ type Provider interface {
 	// MarkFailed transitions an issue from working/ready → failed and posts a
 	// comment explaining the failure.
 	MarkFailed(ctx context.Context, number int, l Labels, reason string) error
+
+	// MarkRequeued returns an issue to the ready queue without marking it
+	// failed. Used when ralph was interrupted (Ctrl+C) and the user likely
+	// wants the next run to pick this issue back up.
+	MarkRequeued(ctx context.Context, number int, l Labels) error
 
 	// MarkResolved removes the working label and closes the issue. Called
 	// after a successful merge as a defensive backstop in case Claude's PR

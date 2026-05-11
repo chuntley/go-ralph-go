@@ -14,8 +14,8 @@ issue end-to-end, or poll a repo for issues labelled "ready" and work them
 in order.
 
 Per-project defaults live in a ".go-ralph-go" TOML file at the project root.
-If a local ".claude" directory is present, it is used as CLAUDE_CONFIG_DIR so
-project-scoped Claude config (agents, MCP, skills, auth) takes effect.`,
+By default ralph uses your system-wide claude install (and its auth). To opt
+in to a project-local config dir, set "claude_config_dir" in .go-ralph-go.`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}

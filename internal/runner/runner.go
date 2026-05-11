@@ -246,17 +246,11 @@ func (r *run) processIssue(ctx context.Context, issueNum int) (resultErr error) 
 		r.log(fmt.Sprintf("warn: mark working: %v", err))
 	}
 
-	// Catch-all cleanup: any non-nil exit (incl. ctx cancel) clears working
-	// label and marks the issue failed with the underlying reason.
-	defer func() {
-		if resultErr == nil {
-			return
-		}
-		// Use a fresh background context — ctx may already be cancelled.
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		_ = r.provider.MarkFailed(cleanupCtx, issueNum, r.labels, truncate(resultErr.Error(), maxReasonLen))
-	}()
+	// Catch-all cleanup: any non-nil exit clears the working label. On user
+	// interrupt (Ctrl+C / SIGTERM → context cancellation) we *requeue* the
+	// issue rather than marking it failed — the user almost certainly wants
+	// the next ralph run to retry it, not have it sitting in the failed pile.
+	defer func() { dispatchCleanup(r.provider, issueNum, r.labels, resultErr) }()
 
 	r.section(fmt.Sprintf("Working %s issue #%d: %s", r.provider.Name(), issueNum, issue.Title))
 
@@ -364,6 +358,9 @@ func (r *run) handleCleanupPR(ctx context.Context, issueNum int) error {
 			return fmt.Errorf("no open PR found for branch %s — Claude may have committed but not pushed; check `git log` and re-run with --pr or push manually", branch)
 		}
 		r.log(fmt.Sprintf("Opened PR #%d on branch %s (no auto-merge).", pr.Number, branch))
+		if pr.URL != "" {
+			r.log("  → " + pr.URL)
+		}
 		_ = git.CheckoutMain(ctx, r.cfg.ProjectRoot, defaultBranch)
 		return nil
 	}
@@ -376,6 +373,9 @@ func (r *run) handleCleanupPR(ctx context.Context, issueNum int) error {
 		return fmt.Errorf("no open PR for branch %s — refine loop did not push a PR", branch)
 	}
 
+	if pr.URL != "" {
+		r.log(fmt.Sprintf("Found PR #%d  →  %s", pr.Number, pr.URL))
+	}
 	r.log(fmt.Sprintf("Waiting for checks on PR #%d...", pr.Number))
 	interval := time.Duration(r.cfg.GitHub.CheckIntervalSeconds) * time.Second
 	if err := r.provider.WaitForChecks(ctx, pr.Number, interval); err != nil {
