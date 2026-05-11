@@ -214,10 +214,16 @@ func (p *Provider) WaitForChecks(ctx context.Context, prNumber int, interval tim
 		}
 		zeroPolls = 0
 		switch strings.ToLower(mr.HeadPipeline.Status) {
-		case "success", "manual", "skipped":
+		case "success", "skipped":
 			return nil
 		case "failed", "canceled":
 			return fmt.Errorf("pipeline %s", mr.HeadPipeline.Status)
+		case "manual":
+			// Pipeline is awaiting a required manual job (e.g. security scan,
+			// gated test). Auto-merging here would skip a CI signal the project
+			// explicitly required, so bail loudly rather than treating it as
+			// success.
+			return errors.New("pipeline status=manual: required manual jobs have not been run — trigger them in GitLab, or remove the manual gate, before re-running ralph")
 		default:
 			select {
 			case <-ctx.Done():

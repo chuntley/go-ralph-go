@@ -116,25 +116,34 @@ func (p *Provider) EnsureLabels(ctx context.Context, l vcs.Labels) error {
 }
 
 func (p *Provider) NextReady(ctx context.Context, l vcs.Labels) (*vcs.Issue, error) {
+	// GitHub's list-issues endpoint returns issues AND pull requests in one
+	// stream, and PRs can carry the same labels. Fetching just one item and
+	// filtering PRs out client-side meant a single ready-labelled PR at the
+	// head of the backlog would cause auto mode to falsely report "no ready
+	// issue" — paginate until we find a real issue or run out of pages.
 	opts := &gh.IssueListByRepoOptions{
-		Labels:    []string{l.Ready},
-		State:     "open",
-		Sort:      "created",
-		Direction: "asc",
-		ListOptions: gh.ListOptions{PerPage: 1},
+		Labels:      []string{l.Ready},
+		State:       "open",
+		Sort:        "created",
+		Direction:   "asc",
+		ListOptions: gh.ListOptions{PerPage: 30},
 	}
-	issues, _, err := p.client.Issues.ListByRepo(ctx, p.owner, p.repo, opts)
-	if err != nil {
-		return nil, fmt.Errorf("list issues: %w", err)
-	}
-	// go-github returns PRs in issue listings; filter them out.
-	for _, i := range issues {
-		if i.IsPullRequest() {
-			continue
+	for {
+		issues, resp, err := p.client.Issues.ListByRepo(ctx, p.owner, p.repo, opts)
+		if err != nil {
+			return nil, fmt.Errorf("list issues: %w", err)
 		}
-		return &vcs.Issue{Number: i.GetNumber(), Title: i.GetTitle(), Body: i.GetBody()}, nil
+		for _, i := range issues {
+			if i.IsPullRequest() {
+				continue
+			}
+			return &vcs.Issue{Number: i.GetNumber(), Title: i.GetTitle(), Body: i.GetBody()}, nil
+		}
+		if resp == nil || resp.NextPage == 0 {
+			return nil, vcs.ErrNoReadyIssue
+		}
+		opts.Page = resp.NextPage
 	}
-	return nil, vcs.ErrNoReadyIssue
 }
 
 func (p *Provider) GetIssue(ctx context.Context, number int) (*vcs.Issue, error) {

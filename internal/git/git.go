@@ -76,5 +76,15 @@ func run(ctx context.Context, dir, name string, args ...string) (string, error) 
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = dir
 	out, err := cmd.CombinedOutput()
+	if err != nil {
+		// Surface git's own diagnostic text alongside the exit status so
+		// callers' wraps carry the real reason (e.g. "fatal: Not possible to
+		// fast-forward, aborting") instead of just "exit status 128". Without
+		// this, CheckoutMain failures in auto mode are essentially undebuggable
+		// from ralph's logs alone.
+		if snippet := strings.TrimSpace(string(out)); snippet != "" {
+			return string(out), fmt.Errorf("%s: %w", snippet, err)
+		}
+	}
 	return string(out), err
 }

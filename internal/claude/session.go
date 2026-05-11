@@ -138,6 +138,16 @@ func (s *Session) Run(ctx context.Context, prompt string) error {
 	streamErr := s.consume(stdout)
 
 	if err := cmd.Wait(); err != nil {
+		// If the process exited because ctx was canceled (Ctrl+C, SIGTERM),
+		// surface the cancellation itself rather than the exec.ExitError that
+		// followed from our cmd.Cancel handler. Callers (runner.dispatchCleanup)
+		// distinguish "user interrupt → requeue the issue" from "claude crashed
+		// → mark failed" via errors.Is(..., context.Canceled); without this the
+		// exec error would mask the cancellation and the issue would be marked
+		// failed instead of requeued.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		// Surface claude's error but include any stream parse error context.
 		if streamErr != nil {
 			return fmt.Errorf("claude exited (%w); stream error: %v", err, streamErr)

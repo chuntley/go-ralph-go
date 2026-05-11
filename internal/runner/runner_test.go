@@ -3,6 +3,7 @@ package runner
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/chuntley/go-ralph-go/internal/config"
 	"github.com/chuntley/go-ralph-go/internal/vcs"
@@ -115,5 +116,24 @@ func TestTruncate(t *testing.T) {
 				t.Errorf("truncate(%q,%d) = %q, want %q", tc.in, tc.n, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestTruncatePreservesUTF8 — truncating across a multi-byte rune must not
+// leave an orphan continuation byte in the result, since the output is posted
+// as a public issue/MR comment.
+func TestTruncatePreservesUTF8(t *testing.T) {
+	// 20 copies of 中 = 60 bytes. With n=20 the byte cut at n-len(marker)=5
+	// would land mid-rune; we expect the function to snap back to the
+	// preceding rune boundary.
+	s := strings.Repeat("中", 20)
+	for _, n := range []int{5, 7, 13, 20, 40, 59} {
+		got := truncate(s, n)
+		if !utf8.ValidString(got) {
+			t.Errorf("truncate(中×20, %d) produced invalid UTF-8: %q", n, got)
+		}
+		if len(got) > n {
+			t.Errorf("truncate(中×20, %d) exceeded budget: len=%d", n, len(got))
+		}
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/chuntley/go-ralph-go/internal/claude"
 	"github.com/chuntley/go-ralph-go/internal/config"
@@ -274,18 +275,32 @@ func (r *run) resolveDefaultBranch(ctx context.Context) string {
 	return br
 }
 
-// truncate clips s to n bytes with a trailing marker if it was clipped.
-// Byte-level (not rune-level) is fine here — output is for issue comments,
-// not user-facing strings.
+// truncate clips s so its byte length doesn't exceed n, appending a trailing
+// marker when truncation occurred. The cut snaps backward to the last UTF-8
+// rune boundary so the result is always valid UTF-8 — the truncated string is
+// posted as a public issue/MR comment via MarkFailed, so a half-rune at the
+// cut would be user-visible (best case: U+FFFD; worst case: API rejection).
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
 	const marker = " …[truncated]"
 	if n <= len(marker) {
-		return s[:n]
+		return s[:lastRuneBoundary(s, n)]
 	}
-	return s[:n-len(marker)] + marker
+	return s[:lastRuneBoundary(s, n-len(marker))] + marker
+}
+
+// lastRuneBoundary returns the largest i ≤ pos such that s[:i] ends on a UTF-8
+// rune boundary (i.e. s[i] is either past the end or a rune-start byte).
+func lastRuneBoundary(s string, pos int) int {
+	if pos >= len(s) {
+		return len(s)
+	}
+	for pos > 0 && !utf8.RuneStart(s[pos]) {
+		pos--
+	}
+	return pos
 }
 
 // requireCleanTree returns an actionable error if the working tree has
