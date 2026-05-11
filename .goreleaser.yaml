@@ -1,0 +1,61 @@
+version: 2
+
+project_name: ralph
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: ralph
+    main: ./cmd/ralph
+    binary: ralph
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      # No reason to ship windows/arm64 yet; uncomment when there's demand.
+      - goos: windows
+        goarch: arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/chuntley/go-ralph-go/internal/cli.version=v{{.Version}}
+
+archives:
+  - id: ralph
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - README.md
+      - LICENSE*
+      - AGENTS.md
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+# release-please owns the CHANGELOG and the release notes body — tell
+# goreleaser to stay out of changelog generation entirely.
+changelog:
+  disable: true
+
+release:
+  # The GitHub Release was already created by release-please; we just attach
+  # the built artefacts to it.
+  mode: append
+  draft: false
+  prerelease: auto
