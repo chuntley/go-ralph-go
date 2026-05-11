@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func decode(t *testing.T, line string) *Event {
@@ -101,5 +102,29 @@ func TestRenderToolInputTruncation(t *testing.T) {
 	}
 	if len(got) > toolInputMaxLen+64 {
 		t.Fatalf("output not truncated: len=%d", len(got))
+	}
+}
+
+// TestRenderToolInputTruncationPreservesUTF8 — tool inputs containing
+// multi-byte runes must not get clipped mid-rune. The rendered text lands in
+// .ralph/output.txt; invalid UTF-8 there would break downstream grep/sed
+// pipelines that assume the file is well-formed.
+func TestRenderToolInputTruncationPreservesUTF8(t *testing.T) {
+	// 中 is a 3-byte rune. Fill the input with enough 中s that the truncation
+	// budget (toolInputMaxLen=400) lands mid-rune at byte 400 — 400/3 leaves
+	// a 1-byte remainder, so position 400 is a continuation byte.
+	big := strings.Repeat("中", 200) // 600 bytes, all multi-byte
+	line := `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Big","input":"` + big + `"}]}}`
+	ev := decode(t, line)
+	var b bytes.Buffer
+	if err := Render(&b, ev); err != nil {
+		t.Fatal(err)
+	}
+	got := b.String()
+	if !utf8.ValidString(got) {
+		t.Fatalf("rendered output is not valid UTF-8 — truncation cut a multi-byte rune: %q", got)
+	}
+	if !strings.Contains(got, "...") {
+		t.Fatalf("expected truncation marker: %q", got)
 	}
 }
