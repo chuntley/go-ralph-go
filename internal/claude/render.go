@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"unicode/utf8"
 )
 
 const toolInputMaxLen = 400
@@ -89,7 +90,14 @@ func renderAssistant(raw json.RawMessage, outerError string) string {
 		case "tool_use":
 			input := string(c.Input)
 			if len(input) > toolInputMaxLen {
-				input = input[:toolInputMaxLen] + "..."
+				// Snap back to the last UTF-8 rune boundary so a multi-byte
+				// rune at the cut doesn't leave an orphan continuation byte
+				// in the terminal + .ralph/output.txt.
+				cut := toolInputMaxLen
+				for cut > 0 && !utf8.RuneStart(input[cut]) {
+					cut--
+				}
+				input = input[:cut] + "..."
 			}
 			fmt.Fprintf(&b, "\n\n[tool: %s] %s\n", c.Name, input)
 		case "text":

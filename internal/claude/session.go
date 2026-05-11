@@ -73,14 +73,24 @@ func NewSession(cfg SessionConfig) (*Session, error) {
 	return &Session{cfg: cfg, id: id}, nil
 }
 
-// ID returns the generated session id.
+// ID returns the current session id.
 func (s *Session) ID() string { return s.id }
 
-// Reset truncates log files. Call between full cycles, not between turns.
+// Reset starts a fresh Claude session and truncates the log files. Call
+// between full cycles, not between turns: each cycle (refine iterations +
+// cleanup pass) is one task and must not share context with the previous
+// task. Without this, auto mode would resume the same session for every
+// issue and Claude's context would compound across unrelated issues.
 func (s *Session) Reset() error {
 	if err := s.ensureLogs(); err != nil {
 		return err
 	}
+	id, err := newUUID()
+	if err != nil {
+		return err
+	}
+	s.id = id
+	s.started = false
 	for _, f := range []*os.File{s.raw, s.pretty, s.stderr} {
 		if err := f.Truncate(0); err != nil {
 			return err

@@ -11,10 +11,19 @@ import (
 )
 
 // fakeProvider is a tiny stub recording which dispatch path the cleanup defer
-// took. We don't need a full Provider — only the methods invoked in the defer.
+// took. We don't need a full Provider — only the methods invoked in the defer
+// and (for handleCleanupPR tests) FindPRForBranch / MarkResolved.
 type fakeProvider struct {
+	// Recorded calls
 	failedReason string
 	requeued     int
+	resolved     int // issue number passed to MarkResolved, or 0 if never called
+
+	// Configurable return for FindPRForBranch — handleCleanupPR tests inject
+	// "PR exists" / "no PR" outcomes through these. Defaults (nil, nil) keep
+	// the historic dispatchCleanup tests untouched.
+	findPRResult *vcs.PR
+	findPRError  error
 }
 
 func (f *fakeProvider) Name() string                              { return "fake" }
@@ -33,9 +42,12 @@ func (f *fakeProvider) MarkRequeued(_ context.Context, n int, _ vcs.Labels) erro
 	f.requeued = n
 	return nil
 }
-func (f *fakeProvider) MarkResolved(context.Context, int, vcs.Labels) error { return nil }
+func (f *fakeProvider) MarkResolved(_ context.Context, n int, _ vcs.Labels) error {
+	f.resolved = n
+	return nil
+}
 func (f *fakeProvider) FindPRForBranch(context.Context, string) (*vcs.PR, error) {
-	return nil, nil
+	return f.findPRResult, f.findPRError
 }
 func (f *fakeProvider) WaitForChecks(context.Context, int, time.Duration) error { return nil }
 func (f *fakeProvider) SquashMergeAndDelete(context.Context, int) error          { return nil }

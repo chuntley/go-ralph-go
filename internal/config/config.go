@@ -75,7 +75,8 @@ type Config struct {
 	// opt in.
 	ClaudeConfigDir string `toml:"claude_config_dir"`
 
-	// PollInterval is the seconds between polls in auto mode. Default: 300.
+	// PollInterval is the seconds between polls in auto mode. Default: 60.
+	// Validate() enforces a minimum of 30 to stay within host rate limits.
 	PollInterval int `toml:"poll_interval"`
 
 	// GitHub holds GitHub-specific overrides.

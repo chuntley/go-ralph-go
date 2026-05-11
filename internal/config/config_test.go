@@ -71,6 +71,41 @@ func TestEnsureGitignoreAppendsWhenMissingTrailingNewline(t *testing.T) {
 	}
 }
 
+// TestDefaultsMatchDocumentation locks the values returned by Defaults() to
+// the numbers documented in the field comments, README, and starter TOML.
+// Past drift: the PollInterval doc-comment said 300 while the actual default
+// was 60, which would mislead anyone reading the GoDoc. Pin each default so
+// future edits to one side without the other fail loudly here.
+func TestDefaultsMatchDocumentation(t *testing.T) {
+	c := Defaults()
+	if c.Iterations != 5 {
+		t.Errorf("Iterations default: got %d, want 5", c.Iterations)
+	}
+	if c.InstructionsDoc != "AGENTS.md" {
+		t.Errorf("InstructionsDoc default: got %q, want %q", c.InstructionsDoc, "AGENTS.md")
+	}
+	if c.OutputDir != ".ralph" {
+		t.Errorf("OutputDir default: got %q, want %q", c.OutputDir, ".ralph")
+	}
+	if c.ClaudeBin != "claude" {
+		t.Errorf("ClaudeBin default: got %q, want %q", c.ClaudeBin, "claude")
+	}
+	if c.PollInterval != 60 {
+		t.Errorf("PollInterval default: got %d, want 60", c.PollInterval)
+	}
+	if c.GitHub.CheckIntervalSeconds != 30 {
+		t.Errorf("GitHub.CheckIntervalSeconds default: got %d, want 30", c.GitHub.CheckIntervalSeconds)
+	}
+	if c.GitHub.Labels.Ready != "ready" || c.GitHub.Labels.Working != "ralph-working" || c.GitHub.Labels.Failed != "ralph-failed" {
+		t.Errorf("label defaults drifted: %+v", c.GitHub.Labels)
+	}
+	// Defaults must round-trip through Validate without error so the public
+	// "all fields optional" contract in the README holds.
+	if err := c.Validate(); err != nil {
+		t.Errorf("Defaults() should pass Validate, got: %v", err)
+	}
+}
+
 func TestLoadDefaultsWhenNoConfigFile(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
