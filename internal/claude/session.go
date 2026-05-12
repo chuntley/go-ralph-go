@@ -206,7 +206,17 @@ func (s *Session) ensureLogs() error {
 	if s.raw != nil {
 		return nil
 	}
-	if err := os.MkdirAll(s.cfg.OutputDir, 0o755); err != nil {
+	// 0o700: session logs contain the full Claude transcript (tool inputs and
+	// results) which may include credentials Claude observed during the run.
+	// Owner-only avoids leaking them to other local users on shared machines.
+	if err := os.MkdirAll(s.cfg.OutputDir, 0o700); err != nil {
+		return err
+	}
+	// MkdirAll is a no-op mode-wise on an existing dir, so explicitly tighten
+	// pre-existing .ralph/ dirs created by older ralph versions (which used
+	// 0o755). Without this, the upgrade path silently keeps world-readable
+	// perms on the very logs we're trying to protect.
+	if err := os.Chmod(s.cfg.OutputDir, 0o700); err != nil {
 		return err
 	}
 	var err error
@@ -223,7 +233,20 @@ func (s *Session) ensureLogs() error {
 }
 
 func openLog(p string) (*os.File, error) {
-	return os.OpenFile(p, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o644)
+	// 0o600: see ensureLogs — these logs may contain credentials and are not
+	// meant to be readable by other local users.
+	f, err := os.OpenFile(p, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	// O_CREATE only applies mode to a freshly-created file. Pre-existing logs
+	// from older ralph versions were created with 0o644; explicitly Chmod so
+	// upgraders don't silently keep world-readable transcripts.
+	if err := f.Chmod(0o600); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
 }
 
 func (s *Session) buildEnv() []string {

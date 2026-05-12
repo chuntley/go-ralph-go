@@ -165,8 +165,15 @@ func newRun(cfg *config.Config) (*run, error) {
 		return nil, err
 	}
 	outDir := filepath.Join(cfg.ProjectRoot, cfg.OutputDir)
-	if err := os.MkdirAll(outDir, 0o755); err != nil {
+	// 0o700: see internal/claude/session.go ensureLogs — the run output dir
+	// holds session transcripts that may contain credentials. Chmod after
+	// MkdirAll because MkdirAll won't change the mode of an existing dir, and
+	// older ralph versions created .ralph/ at 0o755.
+	if err := os.MkdirAll(outDir, 0o700); err != nil {
 		return nil, fmt.Errorf("mkdir output dir: %w", err)
+	}
+	if err := os.Chmod(outDir, 0o700); err != nil {
+		return nil, fmt.Errorf("chmod output dir: %w", err)
 	}
 	sess, err := claude.NewSession(claude.SessionConfig{
 		Bin:             cfg.ClaudeBin,
@@ -476,7 +483,12 @@ func (r *run) printStartupBanner(mode string) {
 }
 
 func (r *run) log(msg string) {
-	line := fmt.Sprintf("[%s] %s\n", time.Now().Format("2006-01-02 15:04:05"), msg)
+	// Redact before writing: several call sites format wrapped errors (`%v`)
+	// whose chain can include git stderr or remote URLs carrying credentials.
+	// dispatchCleanup redacts at the MarkFailed boundary; this redacts at the
+	// stdout / pretty-log boundary so credentials don't survive in terminal
+	// scrollback or CI capture either.
+	line := fmt.Sprintf("[%s] %s\n", time.Now().Format("2006-01-02 15:04:05"), redactSecrets(msg))
 	fmt.Fprint(r.ui, line)
 	_ = r.session.WriteBanner(line)
 }
