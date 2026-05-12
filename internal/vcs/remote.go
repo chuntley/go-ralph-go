@@ -3,8 +3,24 @@ package vcs
 import (
 	"fmt"
 	"net/url"
+	"regexp"
 	"strings"
 )
+
+// urlCredsRE matches the userinfo segment of a URL — i.e. the "user:pass@"
+// or "token@" that may sit between any scheme and the host. Matches any
+// alphabetic scheme rather than just http(s) so error paths for unrecognised
+// schemes (`ftp://...`, `s3://...`) also get redacted. Used by redactURLCreds
+// below so ParseRemote error messages don't echo embedded credentials onto
+// stderr/stdout (e.g. `git config remote.origin.url` set to
+// `https://x-access-token:ghp_...@github.com/...`).
+var urlCredsRE = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.\-]*://)[^@/\s]+@`)
+
+// redactURLCreds masks userinfo in any URL-shaped substring of s so it is safe
+// to embed in error messages that may surface to stdout, stderr, or logs.
+func redactURLCreds(s string) string {
+	return urlCredsRE.ReplaceAllString(s, "${1}***@")
+}
 
 // Remote describes a parsed origin URL.
 type Remote struct {
@@ -37,19 +53,23 @@ func ParseRemote(raw string) (*Remote, error) {
 		rest := strings.TrimPrefix(raw, "git@")
 		colon := strings.Index(rest, ":")
 		if colon < 0 {
-			return nil, fmt.Errorf("malformed scp-style remote: %q", raw)
+			return nil, fmt.Errorf("malformed scp-style remote: %q", redactURLCreds(raw))
 		}
 		host = rest[:colon]
 		path = rest[colon+1:]
 	case strings.HasPrefix(raw, "ssh://") || strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://"):
 		u, err := url.Parse(raw)
 		if err != nil {
-			return nil, fmt.Errorf("parse url: %w", err)
+			// url.Parse's error text includes the original URL, which may carry
+			// userinfo. Redact before wrapping. %s (not %w) because we're
+			// rewriting the underlying message; the lost errors.Is chain isn't
+			// used by callers here.
+			return nil, fmt.Errorf("parse url: %s", redactURLCreds(err.Error()))
 		}
 		host = u.Host
 		path = strings.TrimPrefix(u.Path, "/")
 	default:
-		return nil, fmt.Errorf("unrecognised remote url: %q", raw)
+		return nil, fmt.Errorf("unrecognised remote url: %q", redactURLCreds(raw))
 	}
 
 	path = strings.TrimSuffix(path, ".git")
