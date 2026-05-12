@@ -4,6 +4,39 @@ A single-binary CLI that drives [Claude Code](https://docs.claude.com/claude-cod
 
 ---
 
+### Install
+
+One-liner for macOS and Linux:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/chuntley/go-ralph-go/main/install.sh | sh
+```
+
+Installs to `~/.local/bin/ralph`. Override with `RALPH_INSTALL_DIR=/usr/local/bin` or pin a version with `RALPH_VERSION=v0.1.1`.
+
+**Manual download:** grab a tarball from the [Releases page](https://github.com/chuntley/go-ralph-go/releases), extract `ralph`, and put it on your `$PATH`:
+
+```bash
+tar -xzf ralph_*_darwin_arm64.tar.gz
+mv ralph ~/bin/ralph
+```
+
+Or run the build directly from the repo:
+
+```bash
+go install github.com/chuntley/go-ralph-go/cmd/ralph@latest
+```
+
+Or build from source:
+
+```bash
+git clone https://github.com/chuntley/go-ralph-go.git
+cd go-ralph-go
+go build -o ~/bin/ralph ./cmd/ralph
+```
+
+---
+
 ## What it does
 
 For each task ralph receives, it:
@@ -25,22 +58,6 @@ It does this in three modes:
 | `ralph auto --once`         | Same, but exit after one cycle                 | Yes             |
 
 Supports **GitHub** (including GitHub Enterprise) and **GitLab** (cloud and self-hosted). The provider is auto-detected from the `origin` remote.
-
----
-
-## Install
-
-```bash
-go install github.com/chuntley/go-ralph-go/cmd/ralph@latest
-```
-
-Or build from source:
-
-```bash
-git clone https://github.com/chuntley/go-ralph-go.git
-cd go-ralph-go
-go build -o ~/bin/ralph ./cmd/ralph
-```
 
 ---
 
