@@ -117,7 +117,6 @@ func RunAuto(ctx context.Context, cfg *config.Config, once bool) error {
 				r.log("No ready issues; --once specified, exiting.")
 				return nil
 			}
-			r.log(fmt.Sprintf("No ready issues; sleeping %ds.", r.cfg.PollInterval))
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
