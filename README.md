@@ -42,6 +42,37 @@ cd go-ralph-go
 go build -o ~/bin/ralph ./cmd/ralph
 ```
 
+### Pre-built binaries (GitHub Releases)
+
+One-liner for macOS and Linux — downloads the latest release, verifies the SHA256 against the published `checksums.txt`, and (on macOS) strips the quarantine attribute so Gatekeeper does not block the unsigned binary:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/chuntley/go-ralph-go/main/install.sh | sh
+```
+
+Installs to `~/.local/bin/ralph`. Override with `RALPH_INSTALL_DIR=/usr/local/bin` or pin a version with `RALPH_VERSION=v0.1.1`.
+
+**Manual download:** grab a tarball from the [Releases page](https://github.com/chuntley/go-ralph-go/releases), extract `ralph`, and put it on your `$PATH`:
+
+```bash
+tar -xzf ralph_*_darwin_arm64.tar.gz
+mv ralph ~/bin/ralph
+```
+
+On macOS, the released binaries are not notarized by Apple, so Gatekeeper blocks them on first run with:
+
+> "ralph" cannot be opened because Apple cannot check it for malicious software.
+
+The `install.sh` script handles this automatically. If you downloaded manually, **verify the checksum first** (the unsigned binary lacks Gatekeeper's verification, so the SHA256 in `checksums.txt` is your integrity guarantee), then clear the quarantine attribute:
+
+```bash
+shasum -a 256 ralph_*_darwin_arm64.tar.gz   # compare against checksums.txt from the release
+xattr -d com.apple.quarantine ~/bin/ralph
+ralph version
+```
+
+Binaries you build locally via `go install` or `go build` are not quarantined. Proper notarization is tracked separately and requires an Apple Developer Program account.
+
 Requirements:
 
 - **Go 1.25+** to build
