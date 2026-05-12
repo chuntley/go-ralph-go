@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/chuntley/go-ralph-go/compare/v0.1.1...v0.1.2) (2026-05-12)
+
+
+### Bug Fixes
+
+* redact credentials and tighten session-log permissions ([#5](https://github.com/chuntley/go-ralph-go/issues/5)) ([1babe59](https://github.com/chuntley/go-ralph-go/commit/1babe59856b1c1664ad5263868aa09a702b62c27))
+
 ## [0.1.1](https://github.com/chuntley/go-ralph-go/compare/v0.1.0...v0.1.1) (2026-05-11)
 
 
