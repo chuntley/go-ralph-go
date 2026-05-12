@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.3](https://github.com/chuntley/go-ralph-go/compare/v0.1.2...v0.1.3) (2026-05-12)
+
+
+### Miscellaneous Chores
+
+* release 0.1.3 ([688fb44](https://github.com/chuntley/go-ralph-go/commit/688fb44d698a66ba68b30744b9443e0e6b688551))
+
 ## [0.1.2](https://github.com/chuntley/go-ralph-go/compare/v0.1.1...v0.1.2) (2026-05-12)
 
 
