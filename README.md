@@ -315,3 +315,11 @@ Without an ldflags override, `ralph version` falls back to `runtime/debug.ReadBu
 - **Logs are per-cycle, not per-issue.** Auto mode overwrites `.ralph/output.*` between issues. Historical context lives in the host's PR/issue history.
 - **`--no-merge` not yet a flag on `issue` mode.** If you want a PR without auto-merge, use `ralph run --pr "Work on issue #N"`.
 - **Self-hosted GitLab base URL** is inferred from the remote host; for GHE you must set `[github] base_url` explicitly in `.go-ralph-go`.
+
+---
+
+## License
+
+Licensed under the [MIT License](LICENSE).
+
+Copyright © 2026 Chad Huntley
