@@ -8,8 +8,12 @@ import (
 
 // applyOverrides folds CLI-level overrides onto a loaded Config. Zero/empty
 // values mean "use what's already in cfg". Returns an error if the result is
-// outside the validation bounds (e.g. --iterations too high).
-func applyOverrides(cfg *config.Config, iterations int, instructionsDoc string) error {
+// outside the validation bounds (e.g. --iterations too high, or a min/max that
+// crosses over).
+func applyOverrides(cfg *config.Config, minIterations, iterations int, instructionsDoc string) error {
+	if minIterations > 0 {
+		cfg.MinIterations = minIterations
+	}
 	if iterations > 0 {
 		cfg.Iterations = iterations
 	}

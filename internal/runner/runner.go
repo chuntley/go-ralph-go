@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -322,22 +323,74 @@ func (r *run) requireCleanTree(ctx context.Context) error {
 	return nil
 }
 
-// cycle runs the configured number of refine iterations + a cleanup pass.
+// cycle runs the goal-driven refine loop followed by a cleanup pass.
+//
+// The loop is not a fixed count: each pass drives toward the goal. It always
+// runs at least cfg.MinIterations passes — a completion signal before that
+// floor is deliberately ignored so the work gets a baseline number of critical
+// re-audits rather than stopping the moment Claude first thinks it's done. From
+// the floor up to the cfg.Iterations cap, the loop ends as soon as completion
+// is signalled AND confirmed (by VerifyCommand when configured). Claude is
+// never told either bound, so it can't pace itself or declare "done" early just
+// because a budget is running out.
 func (r *run) cycle(ctx context.Context, workPrompt, cleanupPrompt string) error {
 	if err := r.session.Reset(); err != nil {
 		return fmt.Errorf("reset logs: %w", err)
 	}
-	for i := 1; i <= r.cfg.Iterations; i++ {
+	planRel, planAbs := r.planPaths()
+	// Start each task with a clean plan: a stale plan left by a previous issue
+	// would mislead the first pass of this one.
+	_ = os.Remove(planAbs)
+
+	loopPrompt := renderRefinePrompt(r.cfg, planRel)
+	minPasses := r.cfg.MinIterations
+	maxPasses := r.cfg.Iterations
+	feedback := "" // verify failure / "keep refining" note fed into the next pass
+	done := false
+	for i := 1; i <= maxPasses && !done; i++ {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		r.section(fmt.Sprintf("Iteration %d / %d", i, r.cfg.Iterations))
-		refine := renderRefinePrompt(r.cfg, i, r.cfg.Iterations)
-		prompt := workPrompt + "\n\n" + refine
-		if err := r.session.Run(ctx, prompt); err != nil {
-			return fmt.Errorf("iteration %d: %w", i, err)
+		// The pass counter and bounds are operator-facing only — they are never
+		// put in the prompt (a visible budget invites pacing and premature "done").
+		r.section(fmt.Sprintf("Pass %d (min %d, max %d)", i, minPasses, maxPasses))
+		prompt := workPrompt + "\n\n" + loopPrompt
+		if feedback != "" {
+			prompt += "\n\n" + feedback
 		}
+		if err := r.session.Run(ctx, prompt); err != nil {
+			return fmt.Errorf("pass %d: %w", i, err)
+		}
+
+		if !sawSentinel(r.session.LastTurnText(), r.cfg.CompletionSentinel) {
+			feedback = ""
+			continue
+		}
+		// Below the minimum floor, ignore the completion signal and keep going.
+		// Push for a genuinely deeper pass rather than a rubber-stamp re-confirm.
+		if !honorsCompletion(i, minPasses) {
+			r.log(fmt.Sprintf("Completion signalled on pass %d, but the minimum is %d — continuing to refine.", i, minPasses))
+			feedback = "Do not treat the work as finished yet, and do not justify stopping with \"nothing changed\" or \"already verified\" — passing tests are not proof of correctness. Take another genuinely critical pass: assume mistakes still exist. Re-derive the expected behavior from the goal and confirm the tests actually assert it (tests can be wrong, tautological, or incomplete); hunt for edge/failure cases and subtle correctness or security issues; and consider whether the solution itself should be reworked. Only treat it as done once you truly cannot find anything more to improve."
+			continue
+		}
+		// At/above the floor: a self-emitted token is the weakest possible
+		// oracle (models declare "done" prematurely), so confirm it against the
+		// real build/test suite when one is configured.
+		ok, out := r.confirmComplete(ctx)
+		if ok {
+			r.log("Goal reported complete and verification passed; ending refine loop.")
+			done = true
+			continue
+		}
+		r.log("Completion was signalled but the verify command failed; continuing the loop.")
+		feedback = "Your previous pass emitted the completion signal, but the verification command the harness ran did NOT pass:\n\n" +
+			truncate(out, maxReasonLen) +
+			"\n\nThe goal is not complete. Do not emit the completion signal again until this passes. Fix the underlying issues and continue."
 	}
+	if !done {
+		r.log(fmt.Sprintf("Refine loop hit the %d-pass safety cap without a verified completion; proceeding to cleanup.", maxPasses))
+	}
+
 	r.section("Cleanup pass")
 	if err := r.session.Run(ctx, cleanupPrompt); err != nil {
 		return fmt.Errorf("cleanup pass: %w", err)
@@ -345,13 +398,78 @@ func (r *run) cycle(ctx context.Context, workPrompt, cleanupPrompt string) error
 	return nil
 }
 
-// renderRefinePrompt substitutes {{iter}} and {{total}} into the refine
-// template. Single-pass via strings.NewReplacer for placeholder safety
-// (matches renderIssuePrompt / renderCleanup).
-func renderRefinePrompt(cfg *config.Config, iter, total int) string {
+// confirmComplete decides whether a completion signal should actually end the
+// loop. With no VerifyCommand configured the token is trusted (with a logged
+// caveat); otherwise the command is run in the project root and its exit status
+// is the verdict. Returns the combined output for feedback on failure.
+func (r *run) confirmComplete(ctx context.Context) (bool, string) {
+	cmd := strings.TrimSpace(r.cfg.VerifyCommand)
+	if cmd == "" {
+		r.log("No verify_command configured — accepting the completion signal without an independent gate. Set verify_command in .go-ralph-go for a robust check.")
+		return true, ""
+	}
+	r.log("Verifying completion: " + cmd)
+	return runVerify(ctx, r.cfg.ProjectRoot, cmd)
+}
+
+// runVerify runs cmd via `sh -c` in dir, returning whether it exited cleanly
+// plus its combined output (annotated with the command + exit error on
+// failure, for feeding back to Claude).
+func runVerify(ctx context.Context, dir, cmd string) (bool, string) {
+	c := exec.CommandContext(ctx, "sh", "-c", cmd)
+	c.Dir = dir
+	out, err := c.CombinedOutput()
+	if err != nil {
+		return false, fmt.Sprintf("$ %s\nexit: %v\n%s", cmd, err, out)
+	}
+	return true, string(out)
+}
+
+// planPaths returns the plan file path both relative to the project root (for
+// telling Claude, which runs with cwd = project root) and absolute (for the
+// runner's own file ops). It lives under the gitignored output dir so it never
+// pollutes the user's commits/PR.
+func (r *run) planPaths() (rel, abs string) {
+	rel = filepath.Join(r.cfg.OutputDir, "plan.md")
+	abs = filepath.Join(r.cfg.ProjectRoot, rel)
+	return rel, abs
+}
+
+// honorsCompletion reports whether a completion signal seen on pass i (1-based)
+// may end the loop, given the minimum-passes floor. Below the floor, early
+// completion is ignored so the loop keeps refining. With minPasses=5 the loop
+// runs at least 5 passes: passes 1–4 ignore "done", pass 5 may honour it.
+func honorsCompletion(i, minPasses int) bool { return i >= minPasses }
+
+// sawSentinel reports whether the completion token appears as its own line in
+// text. A whole-line match (not a substring) avoids false positives when Claude
+// merely mentions the token mid-sentence.
+func sawSentinel(text, sentinel string) bool {
+	sentinel = strings.TrimSpace(sentinel)
+	if sentinel == "" {
+		return false
+	}
+	for _, line := range strings.Split(text, "\n") {
+		if strings.TrimSpace(line) == sentinel {
+			return true
+		}
+	}
+	return false
+}
+
+// renderRefinePrompt fills the goal-driven loop template: {{plan_file}},
+// {{sentinel}}, and {{verify}} (a clause that reflects whether a harness-owned
+// VerifyCommand gate is configured). Single-pass via strings.NewReplacer for
+// placeholder safety (matches renderIssuePrompt / renderCleanup).
+func renderRefinePrompt(cfg *config.Config, planFile string) string {
+	verify := "Run the project's full build, test, and lint suite."
+	if cmd := strings.TrimSpace(cfg.VerifyCommand); cmd != "" {
+		verify = fmt.Sprintf("Run the full verification gate. The harness will independently run `%s` and will not accept completion unless it exits cleanly, so make sure it does.", cmd)
+	}
 	r := strings.NewReplacer(
-		"{{iter}}", fmt.Sprintf("%d", iter),
-		"{{total}}", fmt.Sprintf("%d", total),
+		"{{plan_file}}", planFile,
+		"{{sentinel}}", cfg.CompletionSentinel,
+		"{{verify}}", verify,
 	)
 	return r.Replace(cfg.RefinePrompt)
 }
@@ -459,6 +577,59 @@ func modeLabel(openPR bool) string {
 	return "run (local only)"
 }
 
+// accountLabel renders the Claude login a run will bill against — e.g.
+// "you@example.com  ·  usage_based  ·  Acme". Falls back gracefully when no
+// oauthAccount is present (raw API-key auth or a missing .claude.json).
+func accountLabel(a claude.Account) string {
+	if a.Empty() {
+		return "(unknown — no oauthAccount in .claude.json; API-key auth?)"
+	}
+	return a.Label()
+}
+
+// claudeAcctLine renders the account a run will actually use, preferring the
+// authoritative `claude auth status` identity (which reads the real credential
+// store — the macOS Keychain, not a .credentials.json file) over the
+// .claude.json metadata. When the status can't be determined it falls back to
+// metadata; when it says "not logged in" it flags the metadata as unverified.
+func claudeAcctLine(acct claude.Account, st claude.AuthStatus, ok bool) string {
+	if ok && st.LoggedIn {
+		parts := make([]string, 0, 3)
+		if st.Email != "" {
+			parts = append(parts, st.Email)
+		}
+		switch {
+		case st.SubscriptionType != "":
+			parts = append(parts, st.SubscriptionType+" plan")
+		case acct.BillingType != "":
+			parts = append(parts, acct.BillingType)
+		}
+		org := st.OrgName
+		if org == "" {
+			org = acct.Organization
+		}
+		if org != "" {
+			parts = append(parts, org)
+		}
+		if len(parts) == 0 {
+			return "(logged in)"
+		}
+		return strings.Join(parts, "  ·  ")
+	}
+	if ok && !st.LoggedIn {
+		return accountLabel(acct) + "  (metadata only — NOT logged in)"
+	}
+	return accountLabel(acct)
+}
+
+// authLoginHint returns the command to authenticate the given config dir.
+func authLoginHint(effCfgDir string) string {
+	if effCfgDir == "" {
+		return "claude auth login"
+	}
+	return fmt.Sprintf("CLAUDE_CONFIG_DIR=%q claude auth login", effCfgDir)
+}
+
 // printStartupBanner prints a one-time summary of the effective configuration
 // so the developer can confirm ralph picked up the right project + settings.
 func (r *run) printStartupBanner(mode string) {
@@ -466,17 +637,33 @@ func (r *run) printStartupBanner(mode string) {
 	if cfgSrc == "" {
 		cfgSrc = "(defaults; no .go-ralph-go found)"
 	}
-	claudeCfg := r.cfg.ClaudeConfigDir
-	if claudeCfg == "" {
-		claudeCfg = "(system default)"
+	effCfgDir := r.cfg.EffectiveClaudeConfigDir()
+	claudeCfg := "(system default ~/.claude)"
+	switch {
+	case r.cfg.ClaudeConfigDir != "":
+		claudeCfg = effCfgDir
+	case effCfgDir != "":
+		claudeCfg = effCfgDir + "  (from $CLAUDE_CONFIG_DIR)"
 	}
 	fmt.Fprintln(r.ui)
 	fmt.Fprintln(r.ui, "ralph")
 	fmt.Fprintf(r.ui, "  mode         : %s\n", mode)
 	fmt.Fprintf(r.ui, "  project root : %s\n", r.cfg.ProjectRoot)
+	acct := claude.LoadAccount(effCfgDir)
+	authSt, authOK := claude.QueryAuthStatus(r.cfg.ClaudeBin, effCfgDir)
 	fmt.Fprintf(r.ui, "  config       : %s\n", cfgSrc)
 	fmt.Fprintf(r.ui, "  claude config: %s\n", claudeCfg)
-	fmt.Fprintf(r.ui, "  iterations   : %d\n", r.cfg.Iterations)
+	fmt.Fprintf(r.ui, "  claude acct  : %s\n", claudeAcctLine(acct, authSt, authOK))
+	if authOK && !authSt.LoggedIn {
+		fmt.Fprintf(r.ui, "  ⚠ NOT LOGGED IN for this config dir — claude will fail with \"Not logged in\".\n")
+		fmt.Fprintf(r.ui, "                       fix: %s\n", authLoginHint(effCfgDir))
+	}
+	verify := r.cfg.VerifyCommand
+	if verify == "" {
+		verify = "(none — completion signal trusted as-is)"
+	}
+	fmt.Fprintf(r.ui, "  passes       : min %d, max %d\n", r.cfg.MinIterations, r.cfg.Iterations)
+	fmt.Fprintf(r.ui, "  verify cmd   : %s\n", verify)
 	fmt.Fprintf(r.ui, "  output dir   : %s\n", filepath.Join(r.cfg.ProjectRoot, r.cfg.OutputDir))
 	fmt.Fprintln(r.ui)
 }

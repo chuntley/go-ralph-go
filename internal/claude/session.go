@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -31,10 +32,16 @@ type Session struct {
 	id      string
 	started bool
 
-	mu sync.Mutex // guards file handles below
-	raw  *os.File // raw stream-json
-	pretty *os.File // rendered pretty text
-	stderr *os.File // claude stderr
+	mu     sync.Mutex // guards file handles + turn buffer below
+	raw    *os.File   // raw stream-json
+	pretty *os.File   // rendered pretty text
+	stderr *os.File   // claude stderr
+
+	// turn accumulates the assistant's streamed prose for the most recent Run
+	// (text deltas only — not tool I/O). The runner scans it for a completion
+	// signal to decide whether to end the loop early. Reset at the start of
+	// each Run so LastTurnText reflects only the latest turn.
+	turn strings.Builder
 }
 
 type SessionConfig struct {
@@ -107,6 +114,9 @@ func (s *Session) Run(ctx context.Context, prompt string) error {
 	if err := s.ensureLogs(); err != nil {
 		return err
 	}
+	s.mu.Lock()
+	s.turn.Reset()
+	s.mu.Unlock()
 
 	args := []string{
 		"-p",
@@ -166,6 +176,15 @@ func (s *Session) Run(ctx context.Context, prompt string) error {
 	}
 	s.started = true
 	return streamErr
+}
+
+// LastTurnText returns the assistant's streamed prose from the most recent
+// Run (text only, no tool I/O). Used by the runner to scan for a completion
+// signal. Returns "" before the first Run.
+func (s *Session) LastTurnText() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.turn.String()
 }
 
 // WriteBanner appends a section banner to the pretty log (not the raw JSONL).
@@ -289,6 +308,12 @@ func (s *Session) writeEvent(line []byte) error {
 	var ev Event
 	if err := json.Unmarshal(line, &ev); err != nil {
 		return nil // malformed JSON line: skip pretty/UI but keep raw above
+	}
+	// Accumulate assistant prose (text deltas only) so the runner can detect a
+	// completion signal. Tool inputs/results are deliberately excluded — they
+	// would create false positives if a tool echoed the sentinel token.
+	if ev.Type == "stream_event" {
+		s.turn.WriteString(renderStream(ev.Event))
 	}
 	if err := Render(s.pretty, &ev); err != nil {
 		return fmt.Errorf("write pretty log: %w", err)

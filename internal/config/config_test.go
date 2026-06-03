@@ -5,7 +5,50 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/BurntSushi/toml"
 )
+
+// TestStarterTOMLParses guards against a syntax slip in the starter config the
+// `ralph init` command writes. Its fields are all commented out, so it must
+// decode cleanly and leave Defaults untouched when merged.
+func TestStarterTOMLParses(t *testing.T) {
+	cfg := Defaults()
+	if _, err := toml.Decode(starterTOML, &cfg); err != nil {
+		t.Fatalf("starter TOML does not parse: %v", err)
+	}
+	if cfg.MinIterations != 5 || cfg.Iterations != 10 || cfg.CompletionSentinel != "RALPH_GOAL_COMPLETE" {
+		t.Errorf("commented starter TOML should not override defaults: %+v", cfg)
+	}
+}
+
+// TestValidateClampsMinToMax covers the floor/cap relationship: a minimum above
+// the maximum is clamped down (not an error) so a low cap can't deadlock config,
+// while a sub-1 minimum is still rejected and min==max is left alone.
+func TestValidateClampsMinToMax(t *testing.T) {
+	c := Defaults()
+	c.MinIterations = 8
+	c.Iterations = 5
+	if err := c.Validate(); err != nil {
+		t.Fatalf("min > max should clamp, not error: %v", err)
+	}
+	if c.MinIterations != 5 {
+		t.Errorf("min should be clamped to max (5), got %d", c.MinIterations)
+	}
+
+	c = Defaults()
+	c.MinIterations = 0
+	if err := c.Validate(); err == nil {
+		t.Error("expected error when min_iterations < 1")
+	}
+
+	c = Defaults()
+	c.MinIterations = 5
+	c.Iterations = 5
+	if err := c.Validate(); err != nil {
+		t.Errorf("min == max should be valid, got: %v", err)
+	}
+}
 
 func TestEnsureGitignoreCreatesFile(t *testing.T) {
 	dir := t.TempDir()
@@ -78,8 +121,17 @@ func TestEnsureGitignoreAppendsWhenMissingTrailingNewline(t *testing.T) {
 // future edits to one side without the other fail loudly here.
 func TestDefaultsMatchDocumentation(t *testing.T) {
 	c := Defaults()
-	if c.Iterations != 5 {
-		t.Errorf("Iterations default: got %d, want 5", c.Iterations)
+	if c.MinIterations != 5 {
+		t.Errorf("MinIterations default: got %d, want 5", c.MinIterations)
+	}
+	if c.Iterations != 10 {
+		t.Errorf("Iterations default: got %d, want 10", c.Iterations)
+	}
+	if c.CompletionSentinel != "RALPH_GOAL_COMPLETE" {
+		t.Errorf("CompletionSentinel default: got %q, want %q", c.CompletionSentinel, "RALPH_GOAL_COMPLETE")
+	}
+	if c.VerifyCommand != "" {
+		t.Errorf("VerifyCommand default: got %q, want empty", c.VerifyCommand)
 	}
 	if c.InstructionsDoc != "AGENTS.md" {
 		t.Errorf("InstructionsDoc default: got %q, want %q", c.InstructionsDoc, "AGENTS.md")
@@ -106,6 +158,36 @@ func TestDefaultsMatchDocumentation(t *testing.T) {
 	}
 }
 
+func TestEffectiveClaudeConfigDir(t *testing.T) {
+	// 1. Explicit config wins over the environment.
+	c := &Config{ProjectRoot: "/proj", ClaudeConfigDir: "/explicit/dir"}
+	t.Setenv("CLAUDE_CONFIG_DIR", "/env/dir")
+	if got := c.EffectiveClaudeConfigDir(); got != "/explicit/dir" {
+		t.Errorf("explicit config should win, got %q", got)
+	}
+
+	// 2. No explicit config → inherited absolute env var is used as-is.
+	c = &Config{ProjectRoot: "/proj"}
+	t.Setenv("CLAUDE_CONFIG_DIR", "/env/abs")
+	if got := c.EffectiveClaudeConfigDir(); got != "/env/abs" {
+		t.Errorf("absolute env should be used, got %q", got)
+	}
+
+	// 3. Relative env var resolves against ProjectRoot (claude's cwd).
+	c = &Config{ProjectRoot: "/proj"}
+	t.Setenv("CLAUDE_CONFIG_DIR", ".claude")
+	if got := c.EffectiveClaudeConfigDir(); got != "/proj/.claude" {
+		t.Errorf("relative env should resolve against ProjectRoot, got %q", got)
+	}
+
+	// 4. Nothing set → empty (system default ~/.claude).
+	c = &Config{ProjectRoot: "/proj"}
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	if got := c.EffectiveClaudeConfigDir(); got != "" {
+		t.Errorf("expected empty for system default, got %q", got)
+	}
+}
+
 func TestLoadDefaultsWhenNoConfigFile(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
@@ -116,8 +198,8 @@ func TestLoadDefaultsWhenNoConfigFile(t *testing.T) {
 	if cfg.ConfigPath != "" {
 		t.Errorf("expected empty ConfigPath, got %q", cfg.ConfigPath)
 	}
-	if cfg.Iterations != 5 {
-		t.Errorf("expected default iterations=5, got %d", cfg.Iterations)
+	if cfg.Iterations != 10 {
+		t.Errorf("expected default iterations=10, got %d", cfg.Iterations)
 	}
 }
 

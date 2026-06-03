@@ -136,6 +136,49 @@ func TestLogPermissionsTightenOnUpgradePath(t *testing.T) {
 	}
 }
 
+// TestLastTurnTextCapturesAssistantProse verifies that writeEvent accumulates
+// streamed assistant text (and only that) into the turn buffer the runner scans
+// for a completion signal. Tool I/O must be excluded so a tool echoing the
+// sentinel can't trigger a false completion.
+func TestLastTurnTextCapturesAssistantProse(t *testing.T) {
+	dir := t.TempDir()
+	sess, err := NewSession(SessionConfig{
+		Bin:       "claude",
+		WorkDir:   dir,
+		OutputDir: filepath.Join(dir, ".ralph"),
+	})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	t.Cleanup(func() { _ = sess.Close() })
+	if err := sess.ensureLogs(); err != nil {
+		t.Fatalf("ensureLogs: %v", err)
+	}
+
+	lines := []string{
+		`{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"all done\n"}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"RALPH_GOAL_COMPLETE"}}}`,
+		// Tool use must NOT be captured into the turn buffer.
+		`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"echo RALPH_GOAL_COMPLETE"}}]}}`,
+	}
+	for _, l := range lines {
+		if err := sess.writeEvent([]byte(l)); err != nil {
+			t.Fatalf("writeEvent: %v", err)
+		}
+	}
+
+	got := sess.LastTurnText()
+	if got != "all done\nRALPH_GOAL_COMPLETE" {
+		t.Errorf("turn text = %q; want assistant prose only", got)
+	}
+
+	// A fresh Run resets the buffer.
+	sess.turn.Reset()
+	if sess.LastTurnText() != "" {
+		t.Error("expected empty turn text after reset")
+	}
+}
+
 // TestResetTruncatesLogs verifies the original Reset contract (truncate log
 // files) still holds after the session-rotation change.
 func TestResetTruncatesLogs(t *testing.T) {

@@ -29,15 +29,47 @@ type Config struct {
 	// or "" if no file was found and defaults are in use.
 	ConfigPath string `toml:"-"`
 
-	// Iterations is the number of refine iterations before the cleanup
-	// pass. Script default: 5.
+	// MinIterations is the minimum number of refine passes the loop runs before
+	// it will honour a completion signal. Completion before this floor is
+	// ignored and the loop keeps refining — this guarantees the work gets a
+	// baseline number of critical re-audits instead of stopping the moment
+	// Claude first thinks it's done. Enforced silently by the harness; Claude is
+	// never told the floor. Default: 5. Must be >= 1; if it exceeds Iterations
+	// it is clamped down to Iterations (a low cap implies a low floor).
+	MinIterations int `toml:"min_iterations"`
+
+	// Iterations is the MAXIMUM number of refine passes before ralph forces the
+	// cleanup pass. The loop is goal-driven: once MinIterations is reached it
+	// ends as soon as Claude signals the goal is complete (see
+	// CompletionSentinel). This is the upper safety cap against runaway cost.
+	// Default: 10. Must be >= 1 and <= MaxIterations; if it is below
+	// MinIterations, the minimum is clamped down to match.
 	Iterations int `toml:"iterations"`
+
+	// CompletionSentinel is the exact line Claude is told to emit, on its own
+	// line, once the goal is fully met and verified. The runner treats it as a
+	// request to end the loop — confirmed by VerifyCommand when one is set.
+	// Default: "RALPH_GOAL_COMPLETE". Override only if it could collide with
+	// your task's actual output.
+	CompletionSentinel string `toml:"completion_sentinel"`
+
+	// VerifyCommand, if set, is the harness-owned completion gate: when Claude
+	// emits the sentinel, ralph runs this command (via `sh -c`) in the project
+	// root and only ends the loop if it exits 0. This is the robust defense
+	// against premature "done" / reward-hacking — a self-emitted token is the
+	// weakest possible oracle, so the real build/test suite gets the final say.
+	// Empty (default) means the token is trusted as-is, with a logged caveat.
+	// Example: "go test ./... && go build ./... && golangci-lint run".
+	VerifyCommand string `toml:"verify_command"`
 
 	// InstructionsDoc is the project doc Claude is told to follow during
 	// cleanup (e.g. "AGENTS.md", "CLAUDE.md"). Default: "AGENTS.md".
 	InstructionsDoc string `toml:"instructions_doc"`
 
-	// RefinePrompt is appended to the work prompt every iteration.
+	// RefinePrompt is the goal-driven loop prompt appended to the work prompt
+	// every pass. Placeholders: {{plan_file}} (path to the durable plan file),
+	// {{sentinel}} (the CompletionSentinel line), and {{verify}} (a clause
+	// derived from VerifyCommand telling Claude how completion is checked).
 	RefinePrompt string `toml:"refine_prompt"`
 
 	// CleanupPrompt is the cleanup-pass prompt used in PR-opening modes.
@@ -101,33 +133,55 @@ type GitHubConfig struct {
 }
 
 type LabelConfig struct {
-	Ready   string `toml:"ready"`    // default: "ready"
-	Working string `toml:"working"`  // default: "ralph-working"
-	Failed  string `toml:"failed"`   // default: "ralph-failed"
+	Ready   string `toml:"ready"`   // default: "ready"
+	Working string `toml:"working"` // default: "ralph-working"
+	Failed  string `toml:"failed"`  // default: "ralph-failed"
 }
 
 // Defaults returns a Config populated with the script's original behaviour.
 func Defaults() Config {
 	return Config{
-		Iterations:      5,
-		InstructionsDoc: "AGENTS.md",
-		// Self-Refine-style: explicit audit step before refinement; bounded
-		// single-fix scope; explicit anti-early-exit guard because LLMs bias
-		// toward premature "looks done" verdicts. Iteration-aware via
-		// {{iter}}/{{total}}. See README ("How the refine loop works") for
-		// the reasoning behind each line.
-		RefinePrompt: `This is iteration {{iter}} of {{total}}. The loop will run all {{total}} iterations regardless — do not declare the work complete or skip the fix step. Late iterations exist specifically to catch issues that look subtle on early passes.
+		MinIterations:      5,
+		Iterations:         10,
+		CompletionSentinel: "RALPH_GOAL_COMPLETE",
+		InstructionsDoc:    "AGENTS.md",
+		// Goal-driven loop. The work prompt is the GOAL; this prompt runs every
+		// pass and drives toward it. Durable state lives in a plan file on disk
+		// ({{plan_file}}), not in the conversation or an iteration counter, so
+		// Claude is never told how many passes will run and cannot pace itself.
+		// The loop ends when Claude emits {{sentinel}} after verifying the goal
+		// is met — not at a fixed count. See README ("The refine loop") for the
+		// reasoning behind each step.
+		RefinePrompt: `You are driving toward the goal above over as many passes as it takes. Treat the plan file at {{plan_file}} as your durable memory between passes — it, not this conversation, is the source of truth for what remains.
 
-AUDIT: Critically review the current state. List the 1-3 most significant remaining issues, ordered by impact: correctness > security > edge cases > test coverage > performance > style. Be specific — name files, functions, line numbers.
+ORIENT: Read {{plan_file}} and skim recent ` + "`git log`" + `. If the plan file does not exist yet, create it with these sections:
+  GOAL — the goal restated in one paragraph.
+  VERIFY — the exact command(s) that prove the work correct (build + tests + lint).
+  ACCEPTANCE — a checklist of concrete, checkable criteria, each marked done / not-done.
+  REMAINING — ordered list of work left; the top item is what you do next.
+  DONE — append-only log of finished slices (mirrors git history).
+  OUT OF SCOPE — explicit non-goals, to fight scope creep.
 
-FIX: Address the single highest-priority issue from your audit this iteration. Make the focused change and run any relevant tests or linters.
+AUDIT: Critically re-review the current code against the goal and the plan — INCLUDING work from earlier passes. Assume by default that mistakes still exist and that finding them is your job; never treat anything as correct just because you wrote it, it passed before, or nothing changed since the last pass. Read it as a skeptical reviewer who did NOT write it, and scrutinize three things specifically:
+  - Correctness — does the code actually satisfy the goal across edge cases, error paths, and unusual inputs?
+  - The tests themselves — re-derive each expected value from the goal (not from the current code) and confirm the tests assert THAT; check they exercise the real required behavior rather than the implementation, and that negative / boundary / failure cases aren't missing. A green suite is NOT proof: a test can assert the wrong thing, be tautological, or be incomplete.
+  - The approach — could the solution be reworked to be simpler, clearer, or more robust, and is the acceptance set itself correct and complete?
+Treat checked-off ACCEPTANCE items as re-openable: if scrutiny reveals a problem, uncheck it and add the fix to REMAINING. Reorder REMAINING by impact: correctness > security > edge cases > test coverage > performance > style.
 
-Scope: do not add features outside the original task. Do not refactor outside the issue you're fixing this iteration. One concrete improvement per pass.`,
-		CleanupPrompt:   "The Ralph loop just exited{{issue_clause}}. Perform post-loop cleanup per {{instructions_doc}}: push the branch and open a PR.{{closes_clause}}",
-		IssuePrompt:     "Work on {{provider}} issue #{{number}}. Read the title and body carefully; if your host CLI is available (`gh` or `glab`), also read the issue comments — they may contain crucial follow-up context.\n\nTitle: {{title}}\n\nBody:\n{{body}}",
-		OutputDir:       ".ralph",
-		ClaudeBin:       "claude",
-		PollInterval:    60,
+WORK: Make as much fully-verified progress toward the goal as you can this pass. Do not artificially limit yourself to one tiny change, and do not pace yourself for future passes — but keep each change coherent and verified before moving to the next.
+
+VERIFY: {{verify}} Show the command and its real output — do not assert success. A criterion is done only when its check actually passes. Never edit, delete, weaken, skip, hard-code around, or add skip/xfail to a test to make it pass — fix the underlying code. If a test is genuinely wrong, leave it in place and record it under REMAINING for human review.
+
+COMMIT: Commit the finished work with a clear message and save the updated plan to {{plan_file}}.
+
+SCOPE: Do not add features, abstractions, or defensive code beyond the goal, and do not refactor code unrelated to what you are finishing.
+
+COMPLETION: A passing VERIFY command is necessary but NOT sufficient — green tests do not prove correctness (they can assert the wrong values, test the implementation instead of the requirement, or omit cases entirely). Never use "nothing changed since the last pass" or "it was already verified" as evidence of completeness; re-examine from scratch every pass. Before you may declare completion, perform an adversarial review of the ENTIRE diff against the base branch (e.g. ` + "`git diff`" + `) as a skeptical reviewer who did NOT write it, and confirm ALL of: (1) you independently re-derived each acceptance criterion from the goal and the tests genuinely assert it; (2) the tests cover the real behavior plus its edge and failure cases; (3) no rework would make the solution meaningfully more correct or robust; (4) the VERIFY command passes with its real output shown above. Only if all four hold and you genuinely cannot find anything to improve, output the line {{sentinel}} alone on its own line with nothing after it. If anything is uncertain or improvable — however minor — do NOT output {{sentinel}}: record it in the plan and keep working.`,
+		CleanupPrompt: "The Ralph loop just exited{{issue_clause}}. Perform post-loop cleanup per {{instructions_doc}}: push the branch and open a PR.{{closes_clause}}",
+		IssuePrompt:   "Work on {{provider}} issue #{{number}}. Read the title and body carefully; if your host CLI is available (`gh` or `glab`), also read the issue comments — they may contain crucial follow-up context.\n\nTitle: {{title}}\n\nBody:\n{{body}}",
+		OutputDir:     ".ralph",
+		ClaudeBin:     "claude",
+		PollInterval:  60,
 		GitHub: GitHubConfig{
 			Labels: LabelConfig{
 				Ready:   "ready",
@@ -142,11 +196,21 @@ Scope: do not add features outside the original task. Do not refactor outside th
 // Validate normalises and checks the merged config. It is called by Load
 // after merging file contents on top of Defaults.
 func (c *Config) Validate() error {
+	if c.MinIterations < 1 {
+		return fmt.Errorf("min_iterations must be >= 1 (got %d)", c.MinIterations)
+	}
 	if c.Iterations < 1 {
 		return fmt.Errorf("iterations must be >= 1 (got %d)", c.Iterations)
 	}
 	if c.Iterations > MaxIterations {
 		return fmt.Errorf("iterations must be <= %d (got %d) — guard against runaway cost; raise MaxIterations if you really mean this", MaxIterations, c.Iterations)
+	}
+	// The floor can't exceed the cap. Rather than erroring (which would make a
+	// low `-n`/`iterations` cap collide with the default min of 5), clamp the
+	// minimum down — "cap at N passes" implies a floor of at most N. The startup
+	// banner prints the effective min/max so the clamp is visible.
+	if c.MinIterations > c.Iterations {
+		c.MinIterations = c.Iterations
 	}
 	if c.PollInterval < 30 {
 		return fmt.Errorf("poll_interval must be >= 30 seconds (got %d) — host rate limits", c.PollInterval)
@@ -188,6 +252,31 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+// EffectiveClaudeConfigDir returns the config directory the claude CLI will
+// actually use for a run — which is NOT always what ralph configures:
+//
+//  1. an explicit claude_config_dir in .go-ralph-go (already absolutised), else
+//  2. an inherited CLAUDE_CONFIG_DIR environment variable — relative values are
+//     resolved against ProjectRoot, matching how claude resolves them since
+//     ralph runs claude with cwd = ProjectRoot, else
+//  3. "" meaning claude's system default (~/.claude).
+//
+// Surfacing this (rather than just ClaudeConfigDir) is what lets the banner and
+// doctor show the real account/plan a run will bill against.
+func (c *Config) EffectiveClaudeConfigDir() string {
+	if c.ClaudeConfigDir != "" {
+		return c.ClaudeConfigDir
+	}
+	env := os.Getenv("CLAUDE_CONFIG_DIR")
+	if env == "" {
+		return ""
+	}
+	if !filepath.IsAbs(env) {
+		return filepath.Join(c.ProjectRoot, env)
+	}
+	return env
 }
 
 func findConfigFile(start string) (string, bool) {
@@ -287,12 +376,28 @@ const starterTOML = `# go-ralph-go project config — defaults shown, uncomment 
 # Run "ralph doctor" any time to verify ralph picked up this file and your
 # environment is wired correctly.
 
-# iterations       = 5            # refine passes before cleanup (max 50)
+# min_iterations   = 5            # MINIMUM refine passes before a completion
+#                                 # signal is honoured. The loop always runs at
+#                                 # least this many passes (early "done" signals
+#                                 # are ignored) so the work gets real re-audits.
+# iterations       = 10           # MAXIMUM refine passes (safety cap, max 50).
+#                                 # Once the minimum is reached, the loop ends as
+#                                 # soon as the goal verifies complete.
 # instructions_doc = "AGENTS.md"  # doc Claude is told to follow during cleanup
-# output_dir       = ".ralph"     # run logs go here (gitignored)
+# output_dir       = ".ralph"     # run logs + plan.md go here (gitignored)
 # claude_bin       = "claude"
 # poll_interval    = 60           # auto-mode poll seconds (min 30)
 # default_branch   = ""           # override auto-detected default branch
+
+# completion_sentinel = "RALPH_GOAL_COMPLETE"  # line Claude emits when the goal
+#                                              # is done; ends the loop.
+
+# verify_command — the harness-owned completion gate. When set, ralph runs this
+# (via sh -c) in the project root after Claude signals completion and only ends
+# the loop if it exits 0. This is the robust defense against premature "done" /
+# reward-hacking: the real test suite, run by ralph, gets the final say. Highly
+# recommended. Empty (default) = trust the signal as-is, with a logged caveat.
+# verify_command = "go test ./... && go build ./... && golangci-lint run"
 
 # Opt in to a project-local CLAUDE_CONFIG_DIR. Empty (default) = use the
 # system-wide claude install — which is almost always what you want.
@@ -300,31 +405,16 @@ const starterTOML = `# go-ralph-go project config — defaults shown, uncomment 
 # credentials.json (not just memory files).
 # claude_config_dir = ".claude"
 
-# refine_prompt — runs every iteration after the work prompt.
-# Placeholders: {{iter}}, {{total}}.
+# refine_prompt — the goal-driven loop prompt, appended to the work prompt
+# every pass. Placeholders: {{plan_file}}, {{sentinel}}, {{verify}}.
 #
-# The default uses a Self-Refine pattern (audit -> single-fix per pass) with
-# an explicit anti-early-exit clause because LLMs bias toward premature
-# "looks done" verdicts. The loop intentionally runs all N iterations.
-#
-# refine_prompt = """
-# This is iteration {{iter}} of {{total}}. The loop will run all {{total}}
-# iterations regardless — do not declare the work complete or skip the fix
-# step. Late iterations exist specifically to catch issues that look subtle
-# on early passes.
-#
-# AUDIT: Critically review the current state. List the 1-3 most significant
-# remaining issues, ordered by impact: correctness > security > edge cases >
-# test coverage > performance > style. Be specific — name files, functions,
-# line numbers.
-#
-# FIX: Address the single highest-priority issue from your audit this
-# iteration. Make the focused change and run any relevant tests or linters.
-#
-# Scope: do not add features outside the original task. Do not refactor
-# outside the issue you're fixing this iteration. One concrete improvement
-# per pass.
-# """
+# The default treats the work prompt as a GOAL and drives toward it over as many
+# passes as it takes, keeping durable state in a plan file on disk (not in the
+# conversation, and not an iteration counter Claude can see). Each pass orients
+# from the plan, audits, makes verified progress, commits, and updates the plan;
+# the loop ends only when Claude emits {{sentinel}} and the goal verifies. See
+# the README ("The refine loop") for the full default and the reasoning. Override
+# here only if your project needs different structure or scope rules.
 
 # issue_prompt = """
 # Work on {{provider}} issue #{{number}}. Read the title and body carefully;
