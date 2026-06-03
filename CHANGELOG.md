@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/chuntley/go-ralph-go/compare/v0.1.3...v0.2.0) (2026-06-03)
+
+
+### Features
+
+* goal-driven refine loop with min/max passes, verify gate, and auth reporting ([#12](https://github.com/chuntley/go-ralph-go/issues/12)) ([23ffab8](https://github.com/chuntley/go-ralph-go/commit/23ffab86b4ad50f880b5abc2834212430c0e84df))
+
 ## [0.1.3](https://github.com/chuntley/go-ralph-go/compare/v0.1.2...v0.1.3) (2026-05-12)
 
 
