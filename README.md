@@ -41,7 +41,7 @@ go build -o ~/bin/ralph ./cmd/ralph
 
 For each task ralph receives, it:
 
-1. **Refines N times** (default 5) — runs Claude on the work prompt with a "double-check your work" refine instruction appended each pass, resuming the same session so context compounds.
+1. **Refines toward the goal** — treats the work prompt as a *goal* and loops Claude over it, keeping durable state in a plan file on disk. It always runs at least `min_iterations` passes (default 5) — early "done" signals are ignored so the work gets real re-audits — then ends as soon as Claude signals the goal is complete (confirmed by your `verify_command` when set), up to a max-passes cap (`iterations`, default 10). Claude is never told either bound.
 2. **Cleans up** — runs a final pass telling Claude to push a branch and open a PR (matching your project's `AGENTS.md` / `CLAUDE.md` style guide).
 3. **Validates** — waits for CI checks via the host API.
 4. **Merges** — squash-merges, deletes the source branch, and closes the issue.
@@ -91,18 +91,42 @@ ralph init
 Key knobs:
 
 ```toml
-iterations       = 5            # refine passes before cleanup (max 50)
+min_iterations   = 5            # MIN refine passes; early "done" is ignored
+                                # until the loop has run at least this many
+iterations       = 10           # MAX refine passes (safety cap, max 50); once
+                                # the min is met, ends early when goal verifies
 instructions_doc = "AGENTS.md"  # doc Claude is told to follow during cleanup
-output_dir       = ".ralph"     # run logs go here (gitignored)
+output_dir       = ".ralph"     # run logs + plan.md go here (gitignored)
 claude_bin       = "claude"     # override if your binary is elsewhere
 poll_interval    = 60           # auto-mode poll seconds (min 30)
 default_branch   = ""           # override auto-detected default branch
 
+completion_sentinel = "RALPH_GOAL_COMPLETE"  # line Claude emits when goal is done
+
+# The harness-owned completion gate. STRONGLY recommended: when set, ralph runs
+# this itself after Claude signals completion and only stops the loop if it
+# exits 0 — the real test suite, not Claude's self-report, decides "done".
+verify_command = "go test ./... && go build ./... && golangci-lint run"
+
 # Prompt templates — all support placeholders shown.
+# refine_prompt placeholders: {{plan_file}}, {{sentinel}}, {{verify}}
 
 refine_prompt = """
-double check that your work is elegant and complete, ensure all edge cases
-are covered, security issues addressed, and test coverage is complete.
+You are driving toward the goal above over as many passes as it takes. Treat
+the plan file at {{plan_file}} as your durable memory between passes.
+
+ORIENT: read {{plan_file}} (create it if missing) and recent git log.
+AUDIT:  re-review ALL prior work skeptically — assume mistakes still exist;
+        scrutinize the TESTS themselves (re-derive expected values from the
+        goal; a green suite isn't proof); re-open checked-off items if they
+        can be improved or reworked.
+WORK:   make as much fully-verified progress as you can this pass.
+VERIFY: {{verify}} Show real output; never edit/skip tests to pass.
+COMMIT: commit, and save the updated plan to {{plan_file}}.
+COMPLETION: passing VERIFY is necessary but NOT sufficient. Never stop on
+        "nothing changed / already verified". Adversarially review the whole
+        diff as if you didn't write it; output {{sentinel}} ONLY if the tests
+        truly assert the requirement, no rework is warranted, and VERIFY passes.
 """
 
 issue_prompt = """
@@ -149,9 +173,10 @@ Only do this if the directory is **fully provisioned** (contains a `.credentials
 Every relevant config knob has a per-invocation flag:
 
 ```bash
-ralph run -n 3 "small fix"                # iterations override
+ralph run -n 3 "small fix"                # cap at 3 passes (min clamps to 3)
+ralph run --min-iterations 8 -n 15 "..."  # at least 8 passes, at most 15
 ralph issue 42 --instructions-doc CLAUDE.md
-ralph auto --poll 30 --iterations 5       # 30s poll, 5 iterations
+ralph auto --poll 30 --iterations 5       # 30s poll, cap at 5 passes
 ralph auto --once                         # one cycle then exit
 ```
 
@@ -216,16 +241,21 @@ The `gh`/`glab` fallback means **if you're already logged in via the host CLI, r
 
 ---
 
-## The refine prompt — why it looks the way it does
+## The refine loop — why it works the way it does
 
-The default refine prompt blends two community-validated patterns:
+ralph runs a **goal-driven loop**, not a fixed number of "improve this" passes. The design follows the convergent advice of Geoff Huntley's [Ralph methodology](https://ghuntley.com/ralph/) and Anthropic's guidance on [long-running agents](https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents) and [context engineering](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents). Four principles:
 
-1. **Self-Refine** ([Madaan et al., NeurIPS 2023](https://arxiv.org/abs/2303.17651)) — separating an explicit **audit** step from the **fix** step beats single-shot "improve this" prompts by ~20% on average. Our default has an `AUDIT:` section that forces Claude to name specific issues before changing anything, and a `FIX:` section that bounds the change to a single highest-priority item.
-2. **Anti-early-exit guard** — LLMs reliably bias toward declaring "looks complete" before the work actually is. We tell the model explicitly that the loop runs all N iterations regardless and that late iterations exist to catch what early ones missed. This is why ralph **does not** support a completion token / early exit — by design, every iteration runs.
+1. **The work prompt is a goal, and the loop runs until it's met — within a min/max band.** Each pass drives toward the goal. The loop always runs at least `min_iterations` passes (default 5): a completion signal before the floor is **ignored** and the loop keeps refining, so the work gets a guaranteed baseline of critical re-audits instead of stopping the instant Claude first thinks it's done. Once the floor is met it ends as soon as completion is signalled, up to the `iterations` cap (default 10). Per the agent-loop consensus, criteria-driven termination beats a fixed count — and the minimum floor counters the well-documented bias toward premature "looks done" verdicts.
 
-Single-task-per-iteration scope (from Geoff Huntley's [original Ralph methodology](https://ghuntley.com/ralph/)) prevents the loop from drifting into refactors or new features outside the task.
+2. **Durable state lives in a plan file on disk, not in the conversation or a counter.** Each pass reads/updates `.ralph/plan.md` (goal, verify command, acceptance checklist, remaining work). This is Anthropic's `claude-progress.txt` / "structured note-taking" pattern and Huntley's `fix_plan.md` — it survives context compaction and is the single source of truth for what remains. The plan lives under the gitignored output dir, so it never pollutes your commits.
 
-Placeholders available in `refine_prompt`: `{{iter}}`, `{{total}}`. Override the whole template in `.go-ralph-go` if your project needs different audit dimensions or scope rules.
+3. **Claude is never told the pass count.** Telling a model its iteration budget invites *pacing* and *premature wrap-up* — Anthropic notes models "naturally try to wrap up work" as they sense a limit. The pass counter is operator-facing only.
+
+4. **Completion is verified by the harness, not trusted from the model.** A self-emitted "done" token is the weakest possible signal: agents declare completion prematurely, and prompt rules like "don't edit tests" barely dent reward-hacking ([METR](https://metr.org/blog/2025-06-05-recent-reward-hacking/) measured 70–95% persistence). So when Claude emits the completion sentinel, ralph runs your `verify_command` *itself* and only stops the loop if it exits 0; otherwise the failure is fed back and the loop continues. With no `verify_command` set, the token is trusted with a logged caveat — **setting one is strongly recommended.**
+
+5. **No trusting your own prior work — and green tests aren't proof.** LLMs are biased toward treating code they already wrote as correct (the "self-bias" failure in iterative self-refinement), and toward rubber-stamping once a run is "done and verified" (*"nothing changed since the last pass, so it's done"*). The prompt counters both: `AUDIT` re-reviews *all* earlier passes skeptically — including the **tests themselves** (re-deriving each expected value from the goal, since a test can assert the wrong thing or be incomplete) — and may re-open checked-off criteria; and `COMPLETION` treats a passing `verify_command` as **necessary but not sufficient**, forbids "nothing changed / already verified" as evidence, and requires an adversarial review of the whole diff confirming the tests truly assert the requirement and no rework is warranted *before* the sentinel may be emitted.
+
+Self-Refine-style `AUDIT → WORK → VERIFY` structure ([Madaan et al., NeurIPS 2023](https://arxiv.org/abs/2303.17651)) plus scope guards (no features/refactors/defensive code beyond the goal) round it out. Override the whole template in `.go-ralph-go`; placeholders are `{{plan_file}}`, `{{sentinel}}`, and `{{verify}}`.
 
 ## How the refine loop works (Claude internals)
 
@@ -233,12 +263,12 @@ The orchestration shells out to:
 
 ```
 claude -p --verbose --output-format stream-json --include-partial-messages \
-       --session-id <uuid>        # first iteration
-       --resume <uuid>            # subsequent iterations
+       --session-id <uuid>        # first pass
+       --resume <uuid>            # subsequent passes
        "<work_prompt>\n<refine_prompt>"
 ```
 
-All iterations share the same session id, so Claude's context compounds across passes — each iteration sees the prior work. The cleanup pass uses `--resume` on the same session.
+All passes share the same session id, so Claude's context compounds — and the on-disk `plan.md` backs that up so progress survives even if the context is compacted or reset. ralph scans each turn's streamed assistant text for the completion sentinel (on its own line); when seen, it runs the `verify_command` gate before ending the loop. The cleanup pass uses `--resume` on the same session.
 
 Stream-json events are decoded natively in Go (no `jq` dependency); the renderer mirrors the original Bash filter:
 
@@ -255,10 +285,11 @@ On Ctrl+C, ralph sends Claude a polite `SIGINT` with a 10s grace period, then es
 ## Safety guarantees
 
 1. **No work on a dirty tree.** `ralph auto` / `ralph issue` bail at startup if your working tree has uncommitted changes; the auto loop also re-checks between issues to catch mid-run drift.
-2. **No silent runaway.** Iteration count is capped (`MaxIterations = 50`) and `poll_interval` has a 30s floor — guards against typos like `--iterations 5000`.
-3. **No premature merge.** `WaitForChecks` requires two consecutive zero-check polls before concluding "no CI configured" — gives GitHub Actions / GitLab CI time to register checks on a fresh PR.
-4. **No stuck `ralph-working` labels.** Any non-nil exit (including Ctrl+C) clears the working label via a deferred cleanup using a fresh 30s background context. After successful merge, an explicit `MarkResolved` call closes the issue + removes the working label even if Claude's PR body forgot to include `Closes #N`.
-5. **No surprise pushes in local mode.** `ralph run` without `--pr` tells Claude explicitly _not_ to push or open a PR.
+2. **No silent runaway.** The goal-driven loop is bounded by a max-passes cap (`MaxIterations = 50`) and `poll_interval` has a 30s floor — guards against a goal that never converges or a typo like `--iterations 5000`.
+3. **No premature "done".** A self-reported completion signal doesn't end the loop on its own: when `verify_command` is set, ralph re-runs it itself and only stops if it exits 0, so the real test suite — not the model — has the final say.
+4. **No premature merge.** `WaitForChecks` requires two consecutive zero-check polls before concluding "no CI configured" — gives GitHub Actions / GitLab CI time to register checks on a fresh PR.
+5. **No stuck `ralph-working` labels.** Any non-nil exit (including Ctrl+C) clears the working label via a deferred cleanup using a fresh 30s background context. After successful merge, an explicit `MarkResolved` call closes the issue + removes the working label even if Claude's PR body forgot to include `Closes #N`.
+6. **No surprise pushes in local mode.** `ralph run` without `--pr` tells Claude explicitly _not_ to push or open a PR.
 
 ---
 

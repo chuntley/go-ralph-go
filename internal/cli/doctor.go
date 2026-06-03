@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 
 	"github.com/chuntley/go-ralph-go/internal/claude"
 	"github.com/chuntley/go-ralph-go/internal/config"
@@ -46,7 +45,12 @@ func runDoctor(ctx context.Context, out io.Writer) error {
 	}
 	fmt.Fprintf(out, "  [OK]   project root : %s\n", cfg.ProjectRoot)
 	fmt.Fprintf(out, "         config       : %s\n", src)
-	fmt.Fprintf(out, "         iterations   : %d\n", cfg.Iterations)
+	fmt.Fprintf(out, "         passes       : min %d, max %d\n", cfg.MinIterations, cfg.Iterations)
+	if cfg.VerifyCommand != "" {
+		fmt.Fprintf(out, "         verify cmd   : %s\n", cfg.VerifyCommand)
+	} else {
+		fmt.Fprintf(out, "         verify cmd   : (none — completion signal trusted as-is)\n")
+	}
 
 	// 2. Claude binary
 	if path, err := claude.LookupBin(cfg.ClaudeBin); err != nil {
@@ -54,16 +58,43 @@ func runDoctor(ctx context.Context, out io.Writer) error {
 	} else {
 		fmt.Fprintf(out, "  [OK]   claude binary: %s\n", path)
 	}
-	if cfg.ClaudeConfigDir != "" {
-		if st, err := os.Stat(cfg.ClaudeConfigDir); err != nil || !st.IsDir() {
-			fmt.Fprintf(out, "  [FAIL] CLAUDE_CONFIG_DIR: %s — directory missing\n", cfg.ClaudeConfigDir)
-		} else if _, err := os.Stat(filepath.Join(cfg.ClaudeConfigDir, ".credentials.json")); err != nil {
-			fmt.Fprintf(out, "  [WARN] CLAUDE_CONFIG_DIR: %s — no .credentials.json (claude will likely fail with 'Not logged in')\n", cfg.ClaudeConfigDir)
+	effCfgDir := cfg.EffectiveClaudeConfigDir()
+	source := ""
+	if cfg.ClaudeConfigDir == "" && effCfgDir != "" {
+		source = " (from $CLAUDE_CONFIG_DIR)"
+	}
+	if effCfgDir != "" {
+		if st, err := os.Stat(effCfgDir); err != nil || !st.IsDir() {
+			fmt.Fprintf(out, "  [FAIL] CLAUDE_CONFIG_DIR: %s — directory missing%s\n", effCfgDir, source)
 		} else {
-			fmt.Fprintf(out, "  [OK]   CLAUDE_CONFIG_DIR: %s (project-local override)\n", cfg.ClaudeConfigDir)
+			fmt.Fprintf(out, "  [OK]   CLAUDE_CONFIG_DIR: %s%s\n", effCfgDir, source)
 		}
 	} else {
-		fmt.Fprintln(out, "         CLAUDE_CONFIG_DIR: (system-wide — default; opt in via claude_config_dir in .go-ralph-go)")
+		fmt.Fprintln(out, "         CLAUDE_CONFIG_DIR: (system-wide — default ~/.claude; opt in via claude_config_dir in .go-ralph-go)")
+	}
+	// Auth state from `claude auth status` — the real source of truth. On macOS
+	// credentials live in the Keychain, not a .credentials.json file, so a file
+	// check would be unreliable.
+	authHint := "claude auth login"
+	if effCfgDir != "" {
+		authHint = fmt.Sprintf("CLAUDE_CONFIG_DIR=%q claude auth login", effCfgDir)
+	}
+	switch st, ok := claude.QueryAuthStatus(cfg.ClaudeBin, effCfgDir); {
+	case ok && st.LoggedIn:
+		plan := st.SubscriptionType
+		if plan == "" {
+			plan = "—"
+		}
+		fmt.Fprintf(out, "  [OK]   claude auth : logged in as %s (plan: %s)\n", st.Email, plan)
+	case ok && !st.LoggedIn:
+		fmt.Fprintf(out, "  [WARN] claude auth : NOT logged in for this config dir — run `%s`\n", authHint)
+	default:
+		// Couldn't run `claude auth status`; fall back to .claude.json metadata.
+		if acct := claude.LoadAccount(effCfgDir); !acct.Empty() {
+			fmt.Fprintf(out, "         claude auth : (status unavailable; metadata says %s)\n", acct.Label())
+		} else {
+			fmt.Fprintln(out, "         claude auth : (status unavailable)")
+		}
 	}
 
 	// 3. Git

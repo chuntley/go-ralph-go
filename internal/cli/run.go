@@ -11,23 +11,26 @@ import (
 
 func newRunCmd() *cobra.Command {
 	var openPR bool
+	var minIterations int
 	var iterations int
 	var instructionsDoc string
 
 	cmd := &cobra.Command{
 		Use:   "run [prompt...]",
 		Short: "Run the refine loop on an ad-hoc prompt",
-		Long: `Runs N refine iterations against a fresh Claude session in the current
-project, then a cleanup pass. With --pr, the cleanup pass pushes a branch
-and opens a PR (no auto-merge). Without --pr, the loop is fully local and
-does not require a git host.`,
+		Long: `Runs a goal-driven refine loop against a Claude session in the current
+project, then a cleanup pass. The loop drives toward the prompt as a goal and
+ends when Claude signals completion (confirmed by verify_command when set), up
+to a max-passes safety cap. With --pr, the cleanup pass pushes a branch and
+opens a PR (no auto-merge). Without --pr, the loop is fully local and does not
+require a git host.`,
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := config.Load()
 			if err != nil {
 				return fmt.Errorf("load config: %w", err)
 			}
-			if err := applyOverrides(cfg, iterations, instructionsDoc); err != nil {
+			if err := applyOverrides(cfg, minIterations, iterations, instructionsDoc); err != nil {
 				return err
 			}
 			prompt := strings.Join(args, " ")
@@ -36,7 +39,8 @@ does not require a git host.`,
 	}
 
 	cmd.Flags().BoolVar(&openPR, "pr", false, "open a PR after the loop (requires git host)")
-	cmd.Flags().IntVarP(&iterations, "iterations", "n", 0, "override refine iteration count (default: from config, fallback 5)")
+	cmd.Flags().IntVar(&minIterations, "min-iterations", 0, "override the minimum refine passes before completion is honoured (default: from config, fallback 5)")
+	cmd.Flags().IntVarP(&iterations, "iterations", "n", 0, "override the max refine passes safety cap (default: from config, fallback 10)")
 	cmd.Flags().StringVar(&instructionsDoc, "instructions-doc", "", "override the doc Claude is told to follow during cleanup (e.g. CLAUDE.md)")
 	return cmd
 }
