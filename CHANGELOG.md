@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/chuntley/go-ralph-go/compare/v0.2.0...v0.2.1) (2026-06-04)
+
+
+### Bug Fixes
+
+* never let the plan file record an overall "complete" status ([#14](https://github.com/chuntley/go-ralph-go/issues/14)) ([902c847](https://github.com/chuntley/go-ralph-go/commit/902c847618fb8b62bfacc7771e0ea009f378d8bd))
+
 ## [0.2.0](https://github.com/chuntley/go-ralph-go/compare/v0.1.3...v0.2.0) (2026-06-03)
 
 
