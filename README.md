@@ -122,7 +122,9 @@ AUDIT:  re-review ALL prior work skeptically — assume mistakes still exist;
         can be improved or reworked.
 WORK:   make as much fully-verified progress as you can this pass.
 VERIFY: {{verify}} Show real output; never edit/skip tests to pass.
-COMMIT: commit, and save the updated plan to {{plan_file}}.
+COMMIT: commit, and save the updated plan to {{plan_file}} — update checkboxes
+        but NEVER write an overall "complete"/"done" status (that trains the
+        next pass to stop looking; completion is the harness's call).
 COMPLETION: passing VERIFY is necessary but NOT sufficient. Never stop on
         "nothing changed / already verified". Adversarially review the whole
         diff as if you didn't write it; output {{sentinel}} ONLY if the tests
@@ -247,7 +249,7 @@ ralph runs a **goal-driven loop**, not a fixed number of "improve this" passes. 
 
 1. **The work prompt is a goal, and the loop runs until it's met — within a min/max band.** Each pass drives toward the goal. The loop always runs at least `min_iterations` passes (default 5): a completion signal before the floor is **ignored** and the loop keeps refining, so the work gets a guaranteed baseline of critical re-audits instead of stopping the instant Claude first thinks it's done. Once the floor is met it ends as soon as completion is signalled, up to the `iterations` cap (default 10). Per the agent-loop consensus, criteria-driven termination beats a fixed count — and the minimum floor counters the well-documented bias toward premature "looks done" verdicts.
 
-2. **Durable state lives in a plan file on disk, not in the conversation or a counter.** Each pass reads/updates `.ralph/plan.md` (goal, verify command, acceptance checklist, remaining work). This is Anthropic's `claude-progress.txt` / "structured note-taking" pattern and Huntley's `fix_plan.md` — it survives context compaction and is the single source of truth for what remains. The plan lives under the gitignored output dir, so it never pollutes your commits.
+2. **Durable state lives in a plan file on disk, not in the conversation or a counter.** Each pass reads/updates `.ralph/plan.md` (goal, verify command, acceptance checklist, remaining work). This is Anthropic's `claude-progress.txt` / "structured note-taking" pattern and Huntley's `fix_plan.md` — it survives context compaction and is the single source of truth for what remains. The plan lives under the gitignored output dir, so it never pollutes your commits. **The plan never records an overall "complete"/"done" status** — completion is the harness's decision (the sentinel + min-floor + verify gate), never something the plan can assert. A plan that said "done" would just train the next pass to stop looking, so the prompt forbids it and tells Claude to disregard any such marker and re-audit from scratch.
 
 3. **Claude is never told the pass count.** Telling a model its iteration budget invites *pacing* and *premature wrap-up* — Anthropic notes models "naturally try to wrap up work" as they sense a limit. The pass counter is operator-facing only.
 

@@ -370,7 +370,7 @@ func (r *run) cycle(ctx context.Context, workPrompt, cleanupPrompt string) error
 		// Push for a genuinely deeper pass rather than a rubber-stamp re-confirm.
 		if !honorsCompletion(i, minPasses) {
 			r.log(fmt.Sprintf("Completion signalled on pass %d, but the minimum is %d — continuing to refine.", i, minPasses))
-			feedback = "Do not treat the work as finished yet, and do not justify stopping with \"nothing changed\" or \"already verified\" — passing tests are not proof of correctness. Take another genuinely critical pass: assume mistakes still exist. Re-derive the expected behavior from the goal and confirm the tests actually assert it (tests can be wrong, tautological, or incomplete); hunt for edge/failure cases and subtle correctness or security issues; and consider whether the solution itself should be reworked. Only treat it as done once you truly cannot find anything more to improve."
+			feedback = "Do not treat the work as finished yet, and do not justify stopping with \"nothing changed\", \"already verified\", or because the plan says it's complete — a plan that says \"done\" is not evidence, and passing tests are not proof of correctness. Disregard any \"complete\" marker and re-audit the actual code from scratch. Assume mistakes still exist: re-derive the expected behavior from the goal and confirm the tests actually assert it (tests can be wrong, tautological, or incomplete); hunt for edge/failure cases and subtle correctness or security issues; and consider whether the solution itself should be reworked. Only treat it as done once you truly cannot find anything more to improve."
 			continue
 		}
 		// At/above the floor: a self-emitted token is the weakest possible
