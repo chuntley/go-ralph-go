@@ -158,9 +158,11 @@ ORIENT: Read {{plan_file}} and skim recent ` + "`git log`" + `. If the plan file
   GOAL — the goal restated in one paragraph.
   VERIFY — the exact command(s) that prove the work correct (build + tests + lint).
   ACCEPTANCE — a checklist of concrete, checkable criteria, each marked done / not-done.
-  REMAINING — ordered list of work left; the top item is what you do next.
+  REMAINING — ordered list of work left; the top item is what you do next. Even when every criterion is checked, keep a standing item here to re-audit correctness, re-derive the tests from the goal, and look for rework — never empty this list and never replace it with a "complete" note.
   DONE — append-only log of finished slices (mirrors git history).
   OUT OF SCOPE — explicit non-goals, to fight scope creep.
+
+NEVER record the goal itself as "complete", "done", or "finished" anywhere in the plan, and never add an overall status that says so. Whether the work is finished is the harness's decision, signaled ONLY by the {{sentinel}} line in your output for THIS pass — it is never carried in the plan. When you read the plan, treat any pre-existing "complete"/"done"/"all criteria passing" claim as untrustworthy: disregard it and re-audit the actual code from scratch, because a plan that says "done" is exactly the trap that makes a reviewer stop looking.
 
 AUDIT: Critically re-review the current code against the goal and the plan — INCLUDING work from earlier passes. Assume by default that mistakes still exist and that finding them is your job; never treat anything as correct just because you wrote it, it passed before, or nothing changed since the last pass. Read it as a skeptical reviewer who did NOT write it, and scrutinize three things specifically:
   - Correctness — does the code actually satisfy the goal across edge cases, error paths, and unusual inputs?
@@ -172,7 +174,7 @@ WORK: Make as much fully-verified progress toward the goal as you can this pass.
 
 VERIFY: {{verify}} Show the command and its real output — do not assert success. A criterion is done only when its check actually passes. Never edit, delete, weaken, skip, hard-code around, or add skip/xfail to a test to make it pass — fix the underlying code. If a test is genuinely wrong, leave it in place and record it under REMAINING for human review.
 
-COMMIT: Commit the finished work with a clear message and save the updated plan to {{plan_file}}.
+COMMIT: Commit the finished work with a clear message and save the updated plan to {{plan_file}} — updating checkboxes and REMAINING, but never writing an overall "complete"/"done" status.
 
 SCOPE: Do not add features, abstractions, or defensive code beyond the goal, and do not refactor code unrelated to what you are finishing.
 

@@ -102,6 +102,8 @@ func TestDefaultRefinePromptIsGoalDriven(t *testing.T) {
 		"nothing changed since the last pass", // counters the exact failure observed
 		"re-derive",                           // tests must be re-derived from the goal
 		"necessary but NOT sufficient",        // green tests aren't proof
+		"NEVER record the goal",               // the plan must never carry a "complete" status
+		"re-audit the actual code from scratch",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("refine prompt missing anti-rubber-stamp guidance %q", want)
