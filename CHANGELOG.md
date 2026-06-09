@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.2](https://github.com/chuntley/go-ralph-go/compare/v0.2.1...v0.2.2) (2026-06-09)
+
+
+### Bug Fixes
+
+* halt `ralph auto` with an exit reason when an issue is marked failed ([#16](https://github.com/chuntley/go-ralph-go/issues/16)) ([3191cb2](https://github.com/chuntley/go-ralph-go/commit/3191cb2cca9b8bab85032996c4425cdeaeb7ce96))
+
 ## [0.2.1](https://github.com/chuntley/go-ralph-go/compare/v0.2.0...v0.2.1) (2026-06-04)
 
 
