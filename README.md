@@ -195,6 +195,8 @@ ralph auto --once                         # one cycle then exit
 
 Ralph creates these labels on first run (`EnsureLabels`). Rename them in the `[github.labels]` (or `[gitlab.labels]`) section if your project uses different conventions — colors and descriptions are preserved across renames.
 
+**`ralph auto` halts when an issue is marked `ralph-failed`.** Rather than quietly moving on to the next issue, the worker exits non-zero with a reason naming the failed issue, so a broken run surfaces to a human for triage instead of compounding. (A `Ctrl+C` / timeout is different: that *requeues* the in-flight issue as `ready` and exits cleanly — it is not a failure.)
+
 ---
 
 ## Commands
@@ -292,6 +294,7 @@ On Ctrl+C, ralph sends Claude a polite `SIGINT` with a 10s grace period, then es
 4. **No premature merge.** `WaitForChecks` requires two consecutive zero-check polls before concluding "no CI configured" — gives GitHub Actions / GitLab CI time to register checks on a fresh PR.
 5. **No stuck `ralph-working` labels.** Any non-nil exit (including Ctrl+C) clears the working label via a deferred cleanup using a fresh 30s background context. After successful merge, an explicit `MarkResolved` call closes the issue + removes the working label even if Claude's PR body forgot to include `Closes #N`.
 6. **No surprise pushes in local mode.** `ralph run` without `--pr` tells Claude explicitly _not_ to push or open a PR.
+7. **No silent failure in `auto`.** The moment an issue is marked `ralph-failed`, `ralph auto` exits non-zero with a reason instead of moving on — a broken run gets human triage rather than compounding across the queue. (Interrupts requeue the issue and exit cleanly; they are not failures.)
 
 ---
 

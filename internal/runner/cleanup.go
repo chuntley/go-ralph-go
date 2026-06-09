@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"errors"
+	"fmt"
 	"regexp"
 	"time"
 
@@ -17,9 +18,9 @@ const cleanupTimeout = 30 * time.Second
 // dispatchCleanup is the body of processIssue's deferred cleanup. Extracted so
 // it can be exercised directly in tests.
 //
-//   resultErr == nil           → no-op (success path).
-//   ctx.Canceled / deadline    → requeue: clear working/failed, restore ready.
-//   anything else              → mark failed with the (truncated) reason.
+//	resultErr == nil           → no-op (success path).
+//	ctx.Canceled / deadline    → requeue: clear working/failed, restore ready.
+//	anything else              → mark failed with the (truncated) reason.
 //
 // Uses a fresh background context with cleanupTimeout — the originating ctx
 // may already be cancelled (that's how we got here on Ctrl+C).
@@ -34,6 +35,29 @@ func dispatchCleanup(p vcs.Provider, issueNum int, labels vcs.Labels, resultErr 
 		return
 	}
 	_ = p.MarkFailed(ctx, issueNum, labels, truncate(redactSecrets(resultErr.Error()), maxReasonLen))
+}
+
+// autoHaltReason decides whether an auto-loop iteration should halt the whole
+// worker. It mirrors dispatchCleanup's classification so the two stay in sync:
+//
+//	processErr == nil                     → no halt (success).
+//	ctx.Canceled / DeadlineExceeded       → no halt: the issue was requeued
+//	                                         (Ctrl+C / timeout), handled by the
+//	                                         normal cancellation path.
+//	anything else                         → halt: the issue was just labelled
+//	                                         failed, so return an exit reason.
+//
+// Returning an error (rather than logging and continuing) is what makes
+// `ralph auto` stop the moment an issue is marked failed instead of moving on
+// to the next one.
+func autoHaltReason(issueNum int, failedLabel string, processErr error) error {
+	if processErr == nil {
+		return nil
+	}
+	if errors.Is(processErr, context.Canceled) || errors.Is(processErr, context.DeadlineExceeded) {
+		return nil
+	}
+	return fmt.Errorf("auto mode halting: issue #%d was labelled %q after failing — review it before resuming auto: %w", issueNum, failedLabel, processErr)
 }
 
 // secretPatterns matches credentials we may inadvertently include in error

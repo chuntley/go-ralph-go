@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -26,13 +27,13 @@ type fakeProvider struct {
 	findPRError  error
 }
 
-func (f *fakeProvider) Name() string                              { return "fake" }
-func (f *fakeProvider) Whoami(context.Context) (string, error)    { return "fake", nil }
+func (f *fakeProvider) Name() string                                   { return "fake" }
+func (f *fakeProvider) Whoami(context.Context) (string, error)         { return "fake", nil }
 func (f *fakeProvider) EnsureLabels(context.Context, vcs.Labels) error { return nil }
 func (f *fakeProvider) NextReady(context.Context, vcs.Labels) (*vcs.Issue, error) {
 	return nil, vcs.ErrNoReadyIssue
 }
-func (f *fakeProvider) GetIssue(context.Context, int) (*vcs.Issue, error) { return nil, nil }
+func (f *fakeProvider) GetIssue(context.Context, int) (*vcs.Issue, error)  { return nil, nil }
 func (f *fakeProvider) MarkWorking(context.Context, int, vcs.Labels) error { return nil }
 func (f *fakeProvider) MarkFailed(_ context.Context, n int, _ vcs.Labels, reason string) error {
 	f.failedReason = reason
@@ -50,7 +51,7 @@ func (f *fakeProvider) FindPRForBranch(context.Context, string) (*vcs.PR, error)
 	return f.findPRResult, f.findPRError
 }
 func (f *fakeProvider) WaitForChecks(context.Context, int, time.Duration) error { return nil }
-func (f *fakeProvider) SquashMergeAndDelete(context.Context, int) error          { return nil }
+func (f *fakeProvider) SquashMergeAndDelete(context.Context, int) error         { return nil }
 
 func TestCleanupDispatchInterruptedRequeues(t *testing.T) {
 	p := &fakeProvider{}
@@ -87,5 +88,36 @@ func TestCleanupDispatchNilNoop(t *testing.T) {
 	dispatchCleanup(p, 1, vcs.Labels{}, nil)
 	if p.requeued != 0 || p.failedReason != "" {
 		t.Errorf("nil error should be a noop, got requeued=%d failedReason=%q", p.requeued, p.failedReason)
+	}
+}
+
+func TestAutoHaltReasonHaltsOnFailure(t *testing.T) {
+	// A genuine failure (issue gets the ralph-failed label) must halt auto with
+	// an exit reason that names the issue, the label, and wraps the cause.
+	cause := errors.New("checks failed on PR #5")
+	halt := autoHaltReason(99, "ralph-failed", fmt.Errorf("merge: %w", cause))
+	if halt == nil {
+		t.Fatal("expected a halt reason on genuine failure")
+	}
+	if !errors.Is(halt, cause) {
+		t.Error("halt reason should wrap the underlying cause")
+	}
+	for _, want := range []string{"halting", "#99", "ralph-failed"} {
+		if !strings.Contains(halt.Error(), want) {
+			t.Errorf("halt reason %q missing %q", halt.Error(), want)
+		}
+	}
+}
+
+func TestAutoHaltReasonNoHaltOnSuccessOrCancel(t *testing.T) {
+	if halt := autoHaltReason(1, "ralph-failed", nil); halt != nil {
+		t.Errorf("success must not halt, got %v", halt)
+	}
+	// Cancellation / timeout means the issue was requeued, not failed — no halt.
+	if halt := autoHaltReason(1, "ralph-failed", fmt.Errorf("pass 3: %w", context.Canceled)); halt != nil {
+		t.Errorf("cancellation must not halt (issue requeued), got %v", halt)
+	}
+	if halt := autoHaltReason(1, "ralph-failed", context.DeadlineExceeded); halt != nil {
+		t.Errorf("deadline must not halt, got %v", halt)
 	}
 }

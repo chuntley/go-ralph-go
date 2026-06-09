@@ -77,7 +77,9 @@ func RunIssue(ctx context.Context, cfg *config.Config, issueNum int) error {
 }
 
 // RunAuto polls for the oldest ready issue and processes it; loops until
-// canceled (or exits after one cycle if once=true).
+// canceled (or exits after one cycle if once=true). It also halts with an exit
+// reason the moment an issue is marked failed (the ralph-failed label) so a
+// broken run surfaces to a human instead of the worker quietly moving on.
 func RunAuto(ctx context.Context, cfg *config.Config, once bool) error {
 	r, err := newRun(cfg)
 	if err != nil {
@@ -129,13 +131,22 @@ func RunAuto(ctx context.Context, cfg *config.Config, once bool) error {
 		}
 
 		r.section(fmt.Sprintf("Picking up issue #%d: %s  (completed=%d failed=%d)", issue.Number, issue.Title, r.completed, r.failed))
-		if err := r.processIssue(ctx, issue.Number); err != nil {
+		err = r.processIssue(ctx, issue.Number)
+		if halt := autoHaltReason(issue.Number, r.labels.Failed, err); halt != nil {
+			// The issue was just labelled failed. Stop the worker with an exit
+			// reason rather than silently moving on — a failed run almost always
+			// needs a human to look before more work proceeds.
 			r.failed++
 			r.log(fmt.Sprintf("Issue #%d did not complete cleanly: %v", issue.Number, err))
-		} else {
-			r.completed++
-			r.log(fmt.Sprintf("Issue #%d merged. (completed=%d failed=%d)", issue.Number, r.completed, r.failed))
+			return halt
 		}
+		if err != nil {
+			// Interrupted (Ctrl+C / timeout): the issue was requeued, not
+			// failed. Exit cleanly via the normal cancellation path.
+			return err
+		}
+		r.completed++
+		r.log(fmt.Sprintf("Issue #%d merged. (completed=%d failed=%d)", issue.Number, r.completed, r.failed))
 		if once {
 			return nil
 		}
