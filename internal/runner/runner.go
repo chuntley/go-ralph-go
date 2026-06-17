@@ -41,12 +41,25 @@ func RunPrompt(ctx context.Context, cfg *config.Config, prompt string, openPR bo
 	workPrompt := prompt
 	var cleanupPrompt string
 	if openPR {
+		// Same guardrail as issue mode: open the PR from a dedicated branch, never
+		// the default branch. Branches off the current HEAD (run mode does not sync
+		// the default branch), so the user's chosen base is preserved.
+		defaultBranch := r.resolveDefaultBranch(ctx)
+		branch := runBranchName(cfg.BranchPrefix, time.Now().Format("20060102-150405"))
+		if err := git.CreateWorkBranch(ctx, cfg.ProjectRoot, branch); err != nil {
+			return fmt.Errorf("create work branch: %w", err)
+		}
+		r.log(fmt.Sprintf("On branch %s; commits stay off %s.", branch, defaultBranch))
+		workPrompt = branchContextNote(branch, defaultBranch) + "\n\n" + prompt
 		cleanupPrompt = renderCleanup(cfg, 0)
 	} else {
 		cleanupPrompt = "The Ralph loop just exited. Stage and commit any outstanding changes with a clear, descriptive message. Do not push or open a PR."
 	}
 
 	if err := r.cycle(ctx, workPrompt, cleanupPrompt); err != nil {
+		if errors.Is(err, claude.ErrNotLoggedIn) {
+			return r.authFailureError(err)
+		}
 		return err
 	}
 	if !openPR {
@@ -73,7 +86,13 @@ func RunIssue(ctx context.Context, cfg *config.Config, issueNum int) error {
 	if err := r.provider.EnsureLabels(ctx, r.labels); err != nil {
 		return fmt.Errorf("ensure labels: %w", err)
 	}
-	return r.processIssue(ctx, issueNum)
+	if err := r.processIssue(ctx, issueNum); err != nil {
+		if errors.Is(err, claude.ErrNotLoggedIn) {
+			return r.authFailureError(err)
+		}
+		return err
+	}
+	return nil
 }
 
 // RunAuto polls for the oldest ready issue and processes it; loops until
@@ -132,6 +151,13 @@ func RunAuto(ctx context.Context, cfg *config.Config, once bool) error {
 
 		r.section(fmt.Sprintf("Picking up issue #%d: %s  (completed=%d failed=%d)", issue.Number, issue.Title, r.completed, r.failed))
 		err = r.processIssue(ctx, issue.Number)
+		if errors.Is(err, claude.ErrNotLoggedIn) {
+			// Environment problem, not an issue problem: processIssue's cleanup
+			// requeued the issue (it was not marked failed). Halt the worker with
+			// the fix rather than spinning and failing every subsequent issue
+			// identically until a human notices.
+			return r.authFailureError(err)
+		}
 		if halt := autoHaltReason(issue.Number, r.labels.Failed, err); halt != nil {
 			// The issue was just labelled failed. Stop the worker with an exit
 			// reason rather than silently moving on — a failed run almost always
@@ -165,6 +191,13 @@ type run struct {
 	labels   vcs.Labels
 	ui       io.Writer
 
+	// Claude login state for the active config dir, resolved once in newRun via
+	// `claude auth status` and reused by the startup banner (so the probe — and
+	// any macOS Keychain prompt it triggers — runs once per invocation, not
+	// twice). authKnown is false when the status couldn't be determined.
+	authStatus claude.AuthStatus
+	authKnown  bool
+
 	// Auto-mode counters; printed in the run banner between issues.
 	completed int
 	failed    int
@@ -174,6 +207,18 @@ func newRun(cfg *config.Config) (*run, error) {
 	// Preflight: claude must be available before we set anything else up.
 	if _, err := claude.LookupBin(cfg.ClaudeBin); err != nil {
 		return nil, err
+	}
+	// Preflight auth: if claude can tell us conclusively that this config dir has
+	// no usable login, stop now — before touching the issue tracker or the
+	// working tree — with the exact command to fix it. This is the common
+	// new-project footgun: a project-local .claude that holds settings/metadata
+	// but was never logged in. When the status can't be determined we proceed; a
+	// real auth failure mid-run is still caught and reported via the typed
+	// claude.ErrNotLoggedIn surfaced from the session.
+	effCfgDir := cfg.EffectiveClaudeConfigDir()
+	authStatus, authKnown := claude.QueryAuthStatus(cfg.ClaudeBin, effCfgDir)
+	if authKnown && !authStatus.LoggedIn {
+		return nil, fmt.Errorf("claude is not logged in for %s — authenticate first:\n    %s\nthen re-run ralph", claudeCfgLabel(effCfgDir), authLoginHint(effCfgDir))
 	}
 	outDir := filepath.Join(cfg.ProjectRoot, cfg.OutputDir)
 	// 0o700: see internal/claude/session.go ensureLogs — the run output dir
@@ -197,8 +242,10 @@ func newRun(cfg *config.Config) (*run, error) {
 		return nil, err
 	}
 	return &run{
-		cfg:     cfg,
-		session: sess,
+		cfg:        cfg,
+		session:    sess,
+		authStatus: authStatus,
+		authKnown:  authKnown,
 		labels: vcs.Labels{
 			Ready:   cfg.GitHub.Labels.Ready,
 			Working: cfg.GitHub.Labels.Working,
@@ -271,9 +318,22 @@ func (r *run) processIssue(ctx context.Context, issueNum int) (resultErr error) 
 	// the next ralph run to retry it, not have it sitting in the failed pile.
 	defer func() { dispatchCleanup(r.provider, issueNum, r.labels, resultErr) }()
 
+	// Guardrail: put the loop on a dedicated branch BEFORE any work, so every
+	// commit Claude makes — and any push — lands here, never on the protected
+	// default branch. This does not depend on the project's instructions doc;
+	// it is what stops a "push each session" workflow from publishing straight
+	// to the default branch (see issue/PR history). HEAD is on the freshly
+	// pulled default branch (CheckoutMain above), so the branch forks from
+	// up-to-date upstream.
+	branch := issueBranchName(r.cfg.BranchPrefix, issueNum, issue.Title)
+	if err := git.CreateWorkBranch(ctx, r.cfg.ProjectRoot, branch); err != nil {
+		return fmt.Errorf("create work branch: %w", err)
+	}
+	r.log(fmt.Sprintf("On branch %s (off %s); commits stay off %s.", branch, defaultBranch, defaultBranch))
+
 	r.section(fmt.Sprintf("Working %s issue #%d: %s", r.provider.Name(), issueNum, issue.Title))
 
-	workPrompt := renderIssuePrompt(r.cfg, r.provider.Name(), issue)
+	workPrompt := branchContextNote(branch, defaultBranch) + "\n\n" + renderIssuePrompt(r.cfg, r.provider.Name(), issue)
 	cleanupPrompt := renderCleanup(r.cfg, issueNum)
 
 	if err := r.cycle(ctx, workPrompt, cleanupPrompt); err != nil {
@@ -362,9 +422,17 @@ func (r *run) cycle(ctx context.Context, workPrompt, cleanupPrompt string) error
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		// The pass counter and bounds are operator-facing only — they are never
-		// put in the prompt (a visible budget invites pacing and premature "done").
-		r.section(fmt.Sprintf("Pass %d (min %d, max %d)", i, minPasses, maxPasses))
+		// Fresh context every pass: a brand-new session that cannot see the
+		// earlier turns. This is what stops Claude from pacing itself ("I'll
+		// finish the rest next time") or rubber-stamping code it remembers
+		// writing — state carries over only via the plan file and git. The pass
+		// counter/bounds are operator-facing only and stay out of both the prompt
+		// AND the on-disk transcript (sectionConsoleOnly), so a fresh pass can't
+		// read its own loop position back out of .ralph/output.txt.
+		if err := r.session.StartFresh(); err != nil {
+			return fmt.Errorf("start pass %d: %w", i, err)
+		}
+		r.sectionConsoleOnly(fmt.Sprintf("Pass %d (min %d, max %d)", i, minPasses, maxPasses))
 		prompt := workPrompt + "\n\n" + loopPrompt
 		if feedback != "" {
 			prompt += "\n\n" + feedback
@@ -381,7 +449,9 @@ func (r *run) cycle(ctx context.Context, workPrompt, cleanupPrompt string) error
 		// Push for a genuinely deeper pass rather than a rubber-stamp re-confirm.
 		if !honorsCompletion(i, minPasses) {
 			r.log(fmt.Sprintf("Completion signalled on pass %d, but the minimum is %d — continuing to refine.", i, minPasses))
-			feedback = "Do not treat the work as finished yet, and do not justify stopping with \"nothing changed\", \"already verified\", or because the plan says it's complete — a plan that says \"done\" is not evidence, and passing tests are not proof of correctness. Disregard any \"complete\" marker and re-audit the actual code from scratch. Assume mistakes still exist: re-derive the expected behavior from the goal and confirm the tests actually assert it (tests can be wrong, tautological, or incomplete); hunt for edge/failure cases and subtle correctness or security issues; and consider whether the solution itself should be reworked. Only treat it as done once you truly cannot find anything more to improve."
+			// Loop-invisible: this is appended to a fresh pass, so it must stand
+			// on its own and must not reveal that earlier passes happened.
+			feedback = "Before this can be considered finished, do a deeper, genuinely skeptical review — green tests are not proof of correctness. Re-derive the expected behavior directly from the goal and confirm the tests actually assert it (tests can be wrong, tautological, or incomplete); hunt for edge and failure cases and subtle correctness or security issues; and consider whether the solution itself should be reworked. Record anything you find under FINDINGS and fix it. Only signal completion once you genuinely cannot find anything more to improve."
 			continue
 		}
 		// At/above the floor: a self-emitted token is the weakest possible
@@ -394,9 +464,11 @@ func (r *run) cycle(ctx context.Context, workPrompt, cleanupPrompt string) error
 			continue
 		}
 		r.log("Completion was signalled but the verify command failed; continuing the loop.")
-		feedback = "Your previous pass emitted the completion signal, but the verification command the harness ran did NOT pass:\n\n" +
+		// Loop-invisible: appended to a fresh pass; states the failure as a
+		// current fact without revealing that a prior pass claimed completion.
+		feedback = "The verification command does not pass yet:\n\n" +
 			truncate(out, maxReasonLen) +
-			"\n\nThe goal is not complete. Do not emit the completion signal again until this passes. Fix the underlying issues and continue."
+			"\n\nThe goal is not complete. Fix the underlying issues so this command passes, and do not signal completion until it does."
 	}
 	if !done {
 		r.log(fmt.Sprintf("Refine loop hit the %d-pass safety cap without a verified completion; proceeding to cleanup.", maxPasses))
@@ -641,6 +713,25 @@ func authLoginHint(effCfgDir string) string {
 	return fmt.Sprintf("CLAUDE_CONFIG_DIR=%q claude auth login", effCfgDir)
 }
 
+// claudeCfgLabel describes the config dir a run authenticates against, for use
+// in operator-facing messages.
+func claudeCfgLabel(effCfgDir string) string {
+	if effCfgDir == "" {
+		return "the system claude config (~/.claude)"
+	}
+	return effCfgDir
+}
+
+// authFailureError turns a claude.ErrNotLoggedIn into an actionable top-level
+// failure. The cause is the local environment (no usable login for the active
+// config dir), so we point the operator straight at the fix instead of bubbling
+// up a bare "exit status 1". Used by every entry point so the guidance is
+// identical whether the failure is caught at preflight or mid-run.
+func (r *run) authFailureError(err error) error {
+	effCfgDir := r.cfg.EffectiveClaudeConfigDir()
+	return fmt.Errorf("claude is not logged in for %s — ralph did no work. Authenticate with:\n    %s\nthen re-run ralph (underlying: %v)", claudeCfgLabel(effCfgDir), authLoginHint(effCfgDir), err)
+}
+
 // printStartupBanner prints a one-time summary of the effective configuration
 // so the developer can confirm ralph picked up the right project + settings.
 func (r *run) printStartupBanner(mode string) {
@@ -661,14 +752,13 @@ func (r *run) printStartupBanner(mode string) {
 	fmt.Fprintf(r.ui, "  mode         : %s\n", mode)
 	fmt.Fprintf(r.ui, "  project root : %s\n", r.cfg.ProjectRoot)
 	acct := claude.LoadAccount(effCfgDir)
-	authSt, authOK := claude.QueryAuthStatus(r.cfg.ClaudeBin, effCfgDir)
+	// Reuse the auth status resolved in newRun. A conclusive "not logged in" can
+	// never reach here — newRun aborts the run up front with the fix — so the
+	// banner only reports the account (logged-in identity, or metadata when the
+	// status couldn't be determined).
 	fmt.Fprintf(r.ui, "  config       : %s\n", cfgSrc)
 	fmt.Fprintf(r.ui, "  claude config: %s\n", claudeCfg)
-	fmt.Fprintf(r.ui, "  claude acct  : %s\n", claudeAcctLine(acct, authSt, authOK))
-	if authOK && !authSt.LoggedIn {
-		fmt.Fprintf(r.ui, "  ⚠ NOT LOGGED IN for this config dir — claude will fail with \"Not logged in\".\n")
-		fmt.Fprintf(r.ui, "                       fix: %s\n", authLoginHint(effCfgDir))
-	}
+	fmt.Fprintf(r.ui, "  claude acct  : %s\n", claudeAcctLine(acct, r.authStatus, r.authKnown))
 	verify := r.cfg.VerifyCommand
 	if verify == "" {
 		verify = "(none — completion signal trusted as-is)"
@@ -690,10 +780,22 @@ func (r *run) log(msg string) {
 	_ = r.session.WriteBanner(line)
 }
 
-func (r *run) section(title string) {
-	banner := "\n==========================================================\n" +
+func bannerText(title string) string {
+	return "\n==========================================================\n" +
 		fmt.Sprintf("[%s] %s\n", time.Now().Format("2006-01-02 15:04:05"), title) +
 		"==========================================================\n"
-	fmt.Fprint(r.ui, banner)
-	_ = r.session.WriteBanner(banner)
+}
+
+func (r *run) section(title string) {
+	b := bannerText(title)
+	fmt.Fprint(r.ui, b)
+	_ = r.session.WriteBanner(b)
+}
+
+// sectionConsoleOnly prints a banner to the operator console but NOT the
+// on-disk transcript. Used for the per-pass counter ("Pass 3 (min 5, max 10)"):
+// since each pass runs with a fresh context, anything written to .ralph/output.*
+// could be read back by Claude — so the loop position is kept off disk.
+func (r *run) sectionConsoleOnly(title string) {
+	fmt.Fprint(r.ui, bannerText(title))
 }

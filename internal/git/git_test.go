@@ -132,6 +132,49 @@ func TestCurrentBranchReturnsCheckedOutBranch(t *testing.T) {
 	}
 }
 
+func TestCreateWorkBranchCreatesAndChecksOut(t *testing.T) {
+	dir := initRepo(t, "main")
+	if err := CreateWorkBranch(context.Background(), dir, "ralph/issue-3-fix-thing"); err != nil {
+		t.Fatalf("CreateWorkBranch: %v", err)
+	}
+	got, err := CurrentBranch(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "ralph/issue-3-fix-thing" {
+		t.Errorf("current branch = %q; want ralph/issue-3-fix-thing", got)
+	}
+}
+
+func TestCreateWorkBranchResetsExistingBranch(t *testing.T) {
+	// A re-run of the same issue must not fail on "branch already exists" and
+	// must start fresh from the current default-branch HEAD (not stale commits).
+	dir := initRepo(t, "main")
+	mustGit(t, dir, "checkout", "-b", "ralph/issue-3-fix-thing")
+	// Put a commit on the stale branch that a fresh run should NOT inherit.
+	if err := os.WriteFile(filepath.Join(dir, "stale.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, dir, "add", ".")
+	mustGit(t, dir, "commit", "-m", "stale work")
+	mustGit(t, dir, "checkout", "main")
+
+	if err := CreateWorkBranch(context.Background(), dir, "ralph/issue-3-fix-thing"); err != nil {
+		t.Fatalf("CreateWorkBranch on existing branch: %v", err)
+	}
+	got, err := CurrentBranch(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "ralph/issue-3-fix-thing" {
+		t.Errorf("current branch = %q; want ralph/issue-3-fix-thing", got)
+	}
+	// The branch was reset to main's HEAD, so the stale commit's file is gone.
+	if _, err := os.Stat(filepath.Join(dir, "stale.txt")); !os.IsNotExist(err) {
+		t.Errorf("expected stale.txt to be absent after -B reset to main; stat err=%v", err)
+	}
+}
+
 func TestDefaultBranchPrefersOriginHEAD(t *testing.T) {
 	// Make a "remote" bare repo with develop as default, clone it, verify we
 	// pick up develop via symbolic-ref of refs/remotes/origin/HEAD.

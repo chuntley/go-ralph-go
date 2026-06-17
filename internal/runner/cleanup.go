@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"time"
 
+	"github.com/chuntley/go-ralph-go/internal/claude"
 	"github.com/chuntley/go-ralph-go/internal/vcs"
 )
 
@@ -20,6 +21,9 @@ const cleanupTimeout = 30 * time.Second
 //
 //	resultErr == nil           → no-op (success path).
 //	ctx.Canceled / deadline    → requeue: clear working/failed, restore ready.
+//	claude not-logged-in       → requeue: a local auth/environment problem, not
+//	                             the issue's fault — don't burn it into the
+//	                             failed pile; the worker halts separately.
 //	anything else              → mark failed with the (truncated) reason.
 //
 // Uses a fresh background context with cleanupTimeout — the originating ctx
@@ -30,7 +34,7 @@ func dispatchCleanup(p vcs.Provider, issueNum int, labels vcs.Labels, resultErr 
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
 	defer cancel()
-	if errors.Is(resultErr, context.Canceled) || errors.Is(resultErr, context.DeadlineExceeded) {
+	if errors.Is(resultErr, context.Canceled) || errors.Is(resultErr, context.DeadlineExceeded) || errors.Is(resultErr, claude.ErrNotLoggedIn) {
 		_ = p.MarkRequeued(ctx, issueNum, labels)
 		return
 	}
@@ -44,6 +48,10 @@ func dispatchCleanup(p vcs.Provider, issueNum int, labels vcs.Labels, resultErr 
 //	ctx.Canceled / DeadlineExceeded       → no halt: the issue was requeued
 //	                                         (Ctrl+C / timeout), handled by the
 //	                                         normal cancellation path.
+//	claude not-logged-in                  → no halt here: the issue was requeued
+//	                                         (mirrors dispatchCleanup); RunAuto
+//	                                         halts the worker with the auth fix
+//	                                         explicitly, before calling this.
 //	anything else                         → halt: the issue was just labelled
 //	                                         failed, so return an exit reason.
 //
@@ -54,7 +62,7 @@ func autoHaltReason(issueNum int, failedLabel string, processErr error) error {
 	if processErr == nil {
 		return nil
 	}
-	if errors.Is(processErr, context.Canceled) || errors.Is(processErr, context.DeadlineExceeded) {
+	if errors.Is(processErr, context.Canceled) || errors.Is(processErr, context.DeadlineExceeded) || errors.Is(processErr, claude.ErrNotLoggedIn) {
 		return nil
 	}
 	return fmt.Errorf("auto mode halting: issue #%d was labelled %q after failing — review it before resuming auto: %w", issueNum, failedLabel, processErr)

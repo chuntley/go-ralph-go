@@ -73,14 +73,21 @@ func TestRenderIssuePromptPlaceholderInTitleNotReprocessed(t *testing.T) {
 	}
 }
 
-func TestDefaultRefinePromptIsIterationAgnostic(t *testing.T) {
-	got := config.Defaults().RefinePrompt
-	// Claude must never learn how many passes will run, so the prompt carries
-	// neither the legacy {{iter}}/{{total}} placeholders nor any "iteration N
-	// of M" phrasing.
-	for _, banned := range []string{"{{iter}}", "{{total}}", "iteration", "of {{total}}", "passes regardless"} {
-		if strings.Contains(strings.ToLower(got), strings.ToLower(banned)) {
-			t.Errorf("refine prompt leaks iteration awareness via %q: %q", banned, got)
+func TestDefaultRefinePromptIsLoopInvisible(t *testing.T) {
+	got := strings.ToLower(config.Defaults().RefinePrompt)
+	// The prompt must read as a single-shot task. Any mention of passes / loops /
+	// iteration tells Claude it will be re-invoked, which invites pacing ("I'll
+	// finish the rest next time") — the exact failure this guards against. (The
+	// substring "pass" is allowed only in "passes"/"passing" about tests; the
+	// banned phrases below are multi-word so they don't match those.)
+	for _, banned := range []string{
+		"{{iter}}", "{{total}}", "iteration",
+		"this pass", "next pass", "each pass", "every pass", "earlier pass",
+		"previous pass", "future pass", "between passes", "per pass",
+		"as many passes", "passes regardless", "loop",
+	} {
+		if strings.Contains(got, strings.ToLower(banned)) {
+			t.Errorf("refine prompt leaks loop awareness via %q", banned)
 		}
 	}
 }
@@ -89,21 +96,18 @@ func TestDefaultRefinePromptIsGoalDriven(t *testing.T) {
 	got := config.Defaults().RefinePrompt
 	// The goal-driven loop hinges on these sections + the durable-state and
 	// completion-signal placeholders being present.
-	for _, want := range []string{"ORIENT:", "AUDIT:", "WORK:", "VERIFY:", "COMMIT:", "COMPLETION:", "{{plan_file}}", "{{sentinel}}", "{{verify}}"} {
+	for _, want := range []string{"ORIENT:", "AUDIT:", "WORK:", "VERIFY:", "COMMIT:", "COMPLETION:", "FINDINGS", "{{plan_file}}", "{{sentinel}}", "{{verify}}"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("default refine prompt missing %q", want)
 		}
 	}
-	// Guard against self-bias and rubber-stamping: the prompt must force
-	// re-review of prior work, scrutiny of the tests themselves, and reject the
-	// "nothing changed / already verified, so it's done" rationalization.
+	// Guard against self-bias and rubber-stamping: skeptical review, scrutiny of
+	// the tests themselves, "green isn't proof", and no "complete" in the plan.
 	for _, want := range []string{
-		"earlier passes", "adversarial", "skeptical",
-		"nothing changed since the last pass", // counters the exact failure observed
-		"re-derive",                           // tests must be re-derived from the goal
-		"necessary but NOT sufficient",        // green tests aren't proof
-		"NEVER record the goal",               // the plan must never carry a "complete" status
-		"re-audit the actual code from scratch",
+		"skeptical",                    // review as if you didn't write it
+		"re-derive",                    // tests re-derived from the goal
+		"necessary but NOT sufficient", // green tests aren't proof
+		"Never record the goal",        // the plan must never carry a "complete" status
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("refine prompt missing anti-rubber-stamp guidance %q", want)

@@ -41,11 +41,12 @@ go build -o ~/bin/ralph ./cmd/ralph
 
 For each task ralph receives, it:
 
-1. **Refines toward the goal** — treats the work prompt as a *goal* and loops Claude over it, keeping durable state in a plan file on disk. It always runs at least `min_iterations` passes (default 5) — early "done" signals are ignored so the work gets real re-audits — then ends as soon as Claude signals the goal is complete (confirmed by your `verify_command` when set), up to a max-passes cap (`iterations`, default 10). Claude is never told either bound.
-2. **Cleans up** — runs a final pass telling Claude to push a branch and open a PR (matching your project's `AGENTS.md` / `CLAUDE.md` style guide).
-3. **Validates** — waits for CI checks via the host API.
-4. **Merges** — squash-merges, deletes the source branch, and closes the issue.
-5. **Resets** — checks out the default branch and fast-forwards, leaving your repo clean for the next loop.
+1. **Branches** — syncs the default branch, then creates and checks out a dedicated working branch (`ralph/issue-<N>-<slug>`, configurable via `branch_prefix`) *before* any work. This is a guardrail, not a suggestion: because the loop starts on a feature branch, every commit Claude makes — and any push — lands there, never on the protected default branch, regardless of what your instructions doc says.
+2. **Refines toward the goal** — treats the work prompt as a *goal* and loops Claude over it, keeping durable state in a plan file on disk. It always runs at least `min_iterations` passes (default 5) — early "done" signals are ignored so the work gets real re-audits — then ends as soon as Claude signals the goal is complete (confirmed by your `verify_command` when set), up to a max-passes cap (`iterations`, default 10). Claude is never told either bound.
+3. **Cleans up** — runs a final pass telling Claude to push the branch and open a PR (matching your project's `AGENTS.md` / `CLAUDE.md` style guide).
+4. **Validates** — waits for CI checks via the host API.
+5. **Merges** — squash-merges, deletes the source branch, and closes the issue.
+6. **Resets** — checks out the default branch and fast-forwards, leaving your repo clean for the next loop.
 
 It does this in three modes:
 
@@ -111,22 +112,23 @@ verify_command = "go test ./... && go build ./... && golangci-lint run"
 # Prompt templates — all support placeholders shown.
 # refine_prompt placeholders: {{plan_file}}, {{sentinel}}, {{verify}}
 
+# Written as a single-shot task — no mention of "passes"/loops, since ralph runs
+# it with a fresh context each time and revealing the loop invites pacing.
 refine_prompt = """
-You are driving toward the goal above over as many passes as it takes. Treat
-the plan file at {{plan_file}} as your durable memory between passes.
+You are implementing the goal above to a correct, complete, verified state.
+Work from what you can see now: the code, git log, and the plan at {{plan_file}}.
 
 ORIENT: read {{plan_file}} (create it if missing) and recent git log.
-AUDIT:  re-review ALL prior work skeptically — assume mistakes still exist;
-        scrutinize the TESTS themselves (re-derive expected values from the
-        goal; a green suite isn't proof); re-open checked-off items if they
-        can be improved or reworked.
-WORK:   make as much fully-verified progress as you can this pass.
+AUDIT:  review the code as a skeptical reviewer who didn't write it; assume
+        mistakes exist; scrutinize the TESTS themselves (re-derive expected
+        values from the goal; a green suite isn't proof). Record issues in
+        the plan's FINDINGS.
+WORK:   fully drive the goal to done now — implement everything missing/wrong
+        and fix all FINDINGS; don't leave straightforward work unfinished.
 VERIFY: {{verify}} Show real output; never edit/skip tests to pass.
-COMMIT: commit, and save the updated plan to {{plan_file}} — update checkboxes
-        but NEVER write an overall "complete"/"done" status (that trains the
-        next pass to stop looking; completion is the harness's call).
-COMPLETION: passing VERIFY is necessary but NOT sufficient. Never stop on
-        "nothing changed / already verified". Adversarially review the whole
+COMMIT: commit, and refresh {{plan_file}} (acceptance status + findings).
+        NEVER record the goal as "complete"/"done" in the plan.
+COMPLETION: passing VERIFY is necessary but NOT sufficient. Review the whole
         diff as if you didn't write it; output {{sentinel}} ONLY if the tests
         truly assert the requirement, no rework is warranted, and VERIFY passes.
 """
@@ -168,7 +170,15 @@ To opt in to a project-local `CLAUDE_CONFIG_DIR` (project-scoped agents, MCP ser
 claude_config_dir = ".claude"   # absolute or relative to project root
 ```
 
-Only do this if the directory is **fully provisioned** (contains a `.credentials.json` from a real `claude /login`). A directory that exists only to hold ralph's memory files (`.claude/projects/`) is _not_ a valid `CLAUDE_CONFIG_DIR` — pointing claude at it fails immediately with `Not logged in · Please run /login`. `ralph doctor` will flag this with a `[WARN]` if it spots a configured dir without credentials.
+Only do this if the directory has a **real login of its own**. Claude stores credentials _per config dir_ — on Linux as `$CLAUDE_CONFIG_DIR/.credentials.json`, on macOS as a Keychain entry keyed to the dir's path — so a directory that merely holds settings or ralph's memory files (`.claude/projects/`) but was never logged in is _not_ usable: claude fails immediately with `Not logged in · Please run /login`. The `.claude.json` account metadata (email/plan) can be present without any usable login, so don't trust it as proof.
+
+To provision the login, run a real `/login` **with that config dir active**:
+
+```sh
+CLAUDE_CONFIG_DIR=/abs/path/to/project/.claude claude auth login
+```
+
+ralph guards this for you. `ralph doctor` reports the true login state via `claude auth status` (a `[WARN]` if the dir isn't logged in, or if the status can't be verified). And every run preflights auth before touching the issue tracker: if the configured dir has no usable login, ralph stops up front with the exact `claude auth login` command instead of burning into a cryptic pass-1 failure. If a login lapses mid-run, the active issue is requeued (not marked failed) and the worker halts with the same fix.
 
 ### CLI overrides
 
@@ -251,13 +261,13 @@ ralph runs a **goal-driven loop**, not a fixed number of "improve this" passes. 
 
 1. **The work prompt is a goal, and the loop runs until it's met — within a min/max band.** Each pass drives toward the goal. The loop always runs at least `min_iterations` passes (default 5): a completion signal before the floor is **ignored** and the loop keeps refining, so the work gets a guaranteed baseline of critical re-audits instead of stopping the instant Claude first thinks it's done. Once the floor is met it ends as soon as completion is signalled, up to the `iterations` cap (default 10). Per the agent-loop consensus, criteria-driven termination beats a fixed count — and the minimum floor counters the well-documented bias toward premature "looks done" verdicts.
 
-2. **Durable state lives in a plan file on disk, not in the conversation or a counter.** Each pass reads/updates `.ralph/plan.md` (goal, verify command, acceptance checklist, remaining work). This is Anthropic's `claude-progress.txt` / "structured note-taking" pattern and Huntley's `fix_plan.md` — it survives context compaction and is the single source of truth for what remains. The plan lives under the gitignored output dir, so it never pollutes your commits. **The plan never records an overall "complete"/"done" status** — completion is the harness's decision (the sentinel + min-floor + verify gate), never something the plan can assert. A plan that said "done" would just train the next pass to stop looking, so the prompt forbids it and tells Claude to disregard any such marker and re-audit from scratch.
+2. **Each pass runs with a fresh context; durable state lives in a plan file on disk.** Every refine pass is a brand-new Claude session (`--session-id`, never `--resume`) — it cannot see the earlier passes. State carries over only via `.ralph/plan.md` (goal, verify command, acceptance criteria + evidence, findings) and git. This is the canonical Ralph + Anthropic pattern (*"start with a fresh context window… a fresh context improves code review since Claude won't be biased toward code it just wrote"*), and it's load-bearing here: a fresh context is what stops Claude from **pacing itself** ("I'll finish the rest next time") and from **rubber-stamping** code it remembers writing. The plan lives under the gitignored output dir, so it never pollutes your commits, and it never records an overall "complete"/"done" status — completion is the harness's call.
 
-3. **Claude is never told the pass count.** Telling a model its iteration budget invites *pacing* and *premature wrap-up* — Anthropic notes models "naturally try to wrap up work" as they sense a limit. The pass counter is operator-facing only.
+3. **Claude is never told it's being looped at all.** Not just the count — the loop prompt is written as a single-shot task with **no mention of passes, loops, or iteration**, and the pass counter is kept out of both the prompt and the on-disk transcript. Any signal that it will be re-invoked invites pacing and premature wrap-up (Anthropic notes models "naturally try to wrap up work" as they sense a limit), so the design hides the loop entirely; the fresh context per pass enforces it.
 
-4. **Completion is verified by the harness, not trusted from the model.** A self-emitted "done" token is the weakest possible signal: agents declare completion prematurely, and prompt rules like "don't edit tests" barely dent reward-hacking ([METR](https://metr.org/blog/2025-06-05-recent-reward-hacking/) measured 70–95% persistence). So when Claude emits the completion sentinel, ralph runs your `verify_command` *itself* and only stops the loop if it exits 0; otherwise the failure is fed back and the loop continues. With no `verify_command` set, the token is trusted with a logged caveat — **setting one is strongly recommended.**
+4. **Completion is verified by the harness, not trusted from the model.** A self-emitted "done" token is the weakest possible signal: agents declare completion prematurely, and prompt rules like "don't edit tests" barely dent reward-hacking ([METR](https://metr.org/blog/2025-06-05-recent-reward-hacking/) measured 70–95% persistence). So when Claude emits the completion sentinel, ralph runs your `verify_command` *itself* and only stops the loop if it exits 0; otherwise the failure is fed back and another pass runs. There's also a **minimum floor** (`min_iterations`, default 5): a completion signal before the floor is ignored so the work gets a guaranteed baseline of fresh-eyes re-audits. With no `verify_command` set, the token is trusted with a logged caveat — **setting one is strongly recommended.**
 
-5. **No trusting your own prior work — and green tests aren't proof.** LLMs are biased toward treating code they already wrote as correct (the "self-bias" failure in iterative self-refinement), and toward rubber-stamping once a run is "done and verified" (*"nothing changed since the last pass, so it's done"*). The prompt counters both: `AUDIT` re-reviews *all* earlier passes skeptically — including the **tests themselves** (re-deriving each expected value from the goal, since a test can assert the wrong thing or be incomplete) — and may re-open checked-off criteria; and `COMPLETION` treats a passing `verify_command` as **necessary but not sufficient**, forbids "nothing changed / already verified" as evidence, and requires an adversarial review of the whole diff confirming the tests truly assert the requirement and no rework is warranted *before* the sentinel may be emitted.
+5. **Green tests aren't proof.** `AUDIT` reviews the code as a skeptical reviewer who didn't write it — including the **tests themselves** (re-deriving each expected value from the goal, since a test can assert the wrong thing or be incomplete). `COMPLETION` treats a passing `verify_command` as **necessary but not sufficient** and requires a skeptical review of the whole diff confirming the tests truly assert the requirement and no rework is warranted before the sentinel may be emitted. The fresh context per pass (principle 2) is what makes this review genuinely independent rather than a self-rubber-stamp.
 
 Self-Refine-style `AUDIT → WORK → VERIFY` structure ([Madaan et al., NeurIPS 2023](https://arxiv.org/abs/2303.17651)) plus scope guards (no features/refactors/defensive code beyond the goal) round it out. Override the whole template in `.go-ralph-go`; placeholders are `{{plan_file}}`, `{{sentinel}}`, and `{{verify}}`.
 
@@ -267,12 +277,11 @@ The orchestration shells out to:
 
 ```
 claude -p --verbose --output-format stream-json --include-partial-messages \
-       --session-id <uuid>        # first pass
-       --resume <uuid>            # subsequent passes
+       --session-id <new-uuid>     # a FRESH session every refine pass
        "<work_prompt>\n<refine_prompt>"
 ```
 
-All passes share the same session id, so Claude's context compounds — and the on-disk `plan.md` backs that up so progress survives even if the context is compacted or reset. ralph scans each turn's streamed assistant text for the completion sentinel (on its own line); when seen, it runs the `verify_command` gate before ending the loop. The cleanup pass uses `--resume` on the same session.
+Every refine pass gets a **new** session id (`--session-id`, never `--resume`), so Claude starts each pass with a clean context and discovers the current state from `.ralph/plan.md` + git — it has no memory of having been run before. The on-disk transcript (`.ralph/output.*`) keeps accumulating across passes for the operator, but Claude is told not to read it. ralph scans each pass's streamed assistant text for the completion sentinel (on its own line); when seen (and at/above the min floor), it runs the `verify_command` gate before ending the loop. Only the final **cleanup pass** uses `--resume` — it continues the last refine pass so it knows the branch and commits it just produced.
 
 Stream-json events are decoded natively in Go (no `jq` dependency); the renderer mirrors the original Bash filter:
 
@@ -294,7 +303,9 @@ On Ctrl+C, ralph sends Claude a polite `SIGINT` with a 10s grace period, then es
 4. **No premature merge.** `WaitForChecks` requires two consecutive zero-check polls before concluding "no CI configured" — gives GitHub Actions / GitLab CI time to register checks on a fresh PR.
 5. **No stuck `ralph-working` labels.** Any non-nil exit (including Ctrl+C) clears the working label via a deferred cleanup using a fresh 30s background context. After successful merge, an explicit `MarkResolved` call closes the issue + removes the working label even if Claude's PR body forgot to include `Closes #N`.
 6. **No surprise pushes in local mode.** `ralph run` without `--pr` tells Claude explicitly _not_ to push or open a PR.
-7. **No silent failure in `auto`.** The moment an issue is marked `ralph-failed`, `ralph auto` exits non-zero with a reason instead of moving on — a broken run gets human triage rather than compounding across the queue. (Interrupts requeue the issue and exit cleanly; they are not failures.)
+7. **No commits to the protected default branch.** In PR-opening modes (issue / auto / `run --pr`) ralph creates and checks out a dedicated working branch *before* the loop, so a project whose instructions say "push each session" can't publish straight to `main`/`master`. The work prompt also tells Claude it's on that branch and must not commit to the default branch, and the cleanup step still backstops by refusing to proceed if the run somehow ended on the default branch.
+8. **No silent failure in `auto`.** The moment an issue is marked `ralph-failed`, `ralph auto` exits non-zero with a reason instead of moving on — a broken run gets human triage rather than compounding across the queue. (Interrupts requeue the issue and exit cleanly; they are not failures.)
+9. **No usable-login surprises.** Every run preflights `claude auth status` for the active config dir and stops up front with the exact `claude auth login` command if it isn't logged in; an auth failure mid-run requeues the issue (never marks it failed) and halts with the fix.
 
 ---
 

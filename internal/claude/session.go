@@ -24,8 +24,10 @@ const gracePeriodOnCancel = 10 * time.Second
 // stream-json output to the configured log files and rendering pretty text to
 // the caller-supplied UI writer.
 //
-// The first call to Run uses --session-id; subsequent calls use --resume so
-// Claude continues the same conversation. The original ralph.sh did the same.
+// A Run uses --session-id when starting fresh and --resume to continue the
+// current conversation. The runner calls StartFresh before each refine turn to
+// force a brand-new context (every refine pass starts clean), and lets the
+// final cleanup turn --resume the last pass so it knows what was just done.
 type Session struct {
 	cfg SessionConfig
 
@@ -42,6 +44,12 @@ type Session struct {
 	// signal to decide whether to end the loop early. Reset at the start of
 	// each Run so LastTurnText reflects only the latest turn.
 	turn strings.Builder
+
+	// authReason holds the human-readable reason from an authentication-failure
+	// event seen during the current Run (e.g. "Not logged in · Please run
+	// /login"), or "" if none. Set in writeEvent, read in Run to return
+	// ErrNotLoggedIn, and reset at the start of each Run.
+	authReason string
 }
 
 type SessionConfig struct {
@@ -109,6 +117,26 @@ func (s *Session) Reset() error {
 	return nil
 }
 
+// StartFresh rotates to a new session id and clears the started flag WITHOUT
+// truncating the logs, so the next Run begins a brand-new Claude context
+// (--session-id, not --resume) while the on-disk transcript keeps accumulating.
+//
+// The runner calls this before every refine turn so each turn runs with a fresh
+// context: no memory of earlier turns. That removes self-bias toward
+// already-written code and any awareness of being run repeatedly (which would
+// invite pacing). Durable state crosses turns via the plan file + git, not the
+// conversation. Unlike Reset, it preserves the logs and does not reset turn
+// capture (Run does that).
+func (s *Session) StartFresh() error {
+	id, err := newUUID()
+	if err != nil {
+		return err
+	}
+	s.id = id
+	s.started = false
+	return nil
+}
+
 // Run executes one turn of the session against the given prompt.
 func (s *Session) Run(ctx context.Context, prompt string) error {
 	if err := s.ensureLogs(); err != nil {
@@ -116,6 +144,7 @@ func (s *Session) Run(ctx context.Context, prompt string) error {
 	}
 	s.mu.Lock()
 	s.turn.Reset()
+	s.authReason = ""
 	s.mu.Unlock()
 
 	args := []string{
@@ -156,8 +185,22 @@ func (s *Session) Run(ctx context.Context, prompt string) error {
 
 	// Stream + decode + render in real time.
 	streamErr := s.consume(stdout)
+	waitErr := cmd.Wait()
 
-	if err := cmd.Wait(); err != nil {
+	// An authentication failure is an environment problem, not a crash or a task
+	// failure: claude exits non-zero, so its bare exit code is useless to the
+	// operator. Surface it as the typed ErrNotLoggedIn (with claude's own reason)
+	// so the runner can point at `claude auth login` and requeue rather than mark
+	// the issue failed. Checked before the generic exit handling below, and
+	// before setting started=true since no usable session was established.
+	if reason := s.authErrText(); reason != "" {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return fmt.Errorf("%w: %s", ErrNotLoggedIn, reason)
+	}
+
+	if waitErr != nil {
 		// If the process exited because ctx was canceled (Ctrl+C, SIGTERM),
 		// surface the cancellation itself rather than the exec.ExitError that
 		// followed from our cmd.Cancel handler. Callers (runner.dispatchCleanup)
@@ -170,12 +213,21 @@ func (s *Session) Run(ctx context.Context, prompt string) error {
 		}
 		// Surface claude's error but include any stream parse error context.
 		if streamErr != nil {
-			return fmt.Errorf("claude exited (%w); stream error: %v", err, streamErr)
+			return fmt.Errorf("claude exited (%w); stream error: %v", waitErr, streamErr)
 		}
-		return fmt.Errorf("claude exited: %w", err)
+		return fmt.Errorf("claude exited: %w", waitErr)
 	}
 	s.started = true
 	return streamErr
+}
+
+// authErrText returns the auth-failure reason captured during the current Run,
+// or "" if none. Guarded by mu since writeEvent (the setter) runs on the stream
+// goroutine.
+func (s *Session) authErrText() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.authReason
 }
 
 // LastTurnText returns the assistant's streamed prose from the most recent
@@ -308,6 +360,14 @@ func (s *Session) writeEvent(line []byte) error {
 	var ev Event
 	if err := json.Unmarshal(line, &ev); err != nil {
 		return nil // malformed JSON line: skip pretty/UI but keep raw above
+	}
+	// Capture an authentication failure so Run can return ErrNotLoggedIn. Keep
+	// the first reason seen (claude emits it on the assistant event before the
+	// terminal result event repeats it).
+	if s.authReason == "" {
+		if reason := authErrorReason(&ev); reason != "" {
+			s.authReason = reason
+		}
 	}
 	// Accumulate assistant prose (text deltas only) so the runner can detect a
 	// completion signal. Tool inputs/results are deliberately excluded — they

@@ -84,6 +84,18 @@ type Config struct {
 	// develop, trunk, ...). Empty means "auto-detect".
 	DefaultBranch string `toml:"default_branch"`
 
+	// BranchPrefix namespaces the per-task working branch ralph creates and
+	// checks out BEFORE the refine loop in PR-opening modes (issue, auto, and
+	// `run --pr`). With the default "ralph", an issue branch is
+	// "ralph/issue-<N>-<slug>" and an ad-hoc --pr run is "ralph/run-<timestamp>".
+	//
+	// This is the guardrail against committing straight to the protected default
+	// branch: because ralph starts the loop on a feature branch, every commit
+	// Claude makes — and any push — lands on that branch, never on the default
+	// branch, regardless of what the project's instructions doc says. Set to ""
+	// to drop the namespace (branches become "issue-<N>-<slug>").
+	BranchPrefix string `toml:"branch_prefix"`
+
 	// OutputDir is where ralph-output.{txt,jsonl,stderr} are written,
 	// relative to ProjectRoot. Default: ".ralph".
 	OutputDir string `toml:"output_dir"`
@@ -145,44 +157,46 @@ func Defaults() Config {
 		Iterations:         10,
 		CompletionSentinel: "RALPH_GOAL_COMPLETE",
 		InstructionsDoc:    "AGENTS.md",
-		// Goal-driven loop. The work prompt is the GOAL; this prompt runs every
-		// pass and drives toward it. Durable state lives in a plan file on disk
-		// ({{plan_file}}), not in the conversation or an iteration counter, so
-		// Claude is never told how many passes will run and cannot pace itself.
-		// The loop ends when Claude emits {{sentinel}} after verifying the goal
-		// is met — not at a fixed count. See README ("The refine loop") for the
-		// reasoning behind each step.
-		RefinePrompt: `You are driving toward the goal above over as many passes as it takes. Treat the plan file at {{plan_file}} as your durable memory between passes — it, not this conversation, is the source of truth for what remains.
+		// Goal-driven loop. The work prompt is the GOAL; this prompt drives toward
+		// it. The runner runs it repeatedly with a FRESH context each time (a new
+		// session, never --resume) until the goal verifies — but the prompt is
+		// deliberately written as a single-shot task with NO mention of passes,
+		// loops, or iteration. That, plus the fresh context, is what stops Claude
+		// from pacing itself ("I'll finish the rest next time") or rubber-stamping
+		// code it remembers writing. Durable state crosses runs via the plan file
+		// on disk ({{plan_file}}) and git — never the conversation. Completion is
+		// the harness's decision, signaled only by {{sentinel}}. See README
+		// ("The refine loop") for the reasoning behind each step.
+		RefinePrompt: `You are implementing the goal described above to a correct, complete, and verified state. Work from what you can see right now — the code, ` + "`git log`" + `, and the plan file at {{plan_file}}, which together hold the current state of the work.
 
-ORIENT: Read {{plan_file}} and skim recent ` + "`git log`" + `. If the plan file does not exist yet, create it with these sections:
+ORIENT: Read {{plan_file}} and skim recent ` + "`git log`" + ` to understand where things stand. If the plan file does not exist yet, create it with these sections:
   GOAL — the goal restated in one paragraph.
   VERIFY — the exact command(s) that prove the work correct (build + tests + lint).
-  ACCEPTANCE — a checklist of concrete, checkable criteria, each marked done / not-done.
-  REMAINING — ordered list of work left; the top item is what you do next. Even when every criterion is checked, keep a standing item here to re-audit correctness, re-derive the tests from the goal, and look for rework — never empty this list and never replace it with a "complete" note.
-  DONE — append-only log of finished slices (mirrors git history).
+  ACCEPTANCE — concrete, checkable criteria, each with its current status and the evidence (real command output) backing it.
+  FINDINGS — known problems that still need fixing (bugs, weak or missing tests, rework); remove an item only once it is actually fixed and verified.
   OUT OF SCOPE — explicit non-goals, to fight scope creep.
+Rely only on these and the code itself — do not read ralph's own run logs under the output directory.
 
-NEVER record the goal itself as "complete", "done", or "finished" anywhere in the plan, and never add an overall status that says so. Whether the work is finished is the harness's decision, signaled ONLY by the {{sentinel}} line in your output for THIS pass — it is never carried in the plan. When you read the plan, treat any pre-existing "complete"/"done"/"all criteria passing" claim as untrustworthy: disregard it and re-audit the actual code from scratch, because a plan that says "done" is exactly the trap that makes a reviewer stop looking.
-
-AUDIT: Critically re-review the current code against the goal and the plan — INCLUDING work from earlier passes. Assume by default that mistakes still exist and that finding them is your job; never treat anything as correct just because you wrote it, it passed before, or nothing changed since the last pass. Read it as a skeptical reviewer who did NOT write it, and scrutinize three things specifically:
+AUDIT: Review the current code against the goal as a skeptical reviewer who did NOT write it. Assume mistakes exist and that finding them is your job; never trust that something is correct just because the plan or a comment claims so — confirm it against the code. Scrutinize three things specifically:
   - Correctness — does the code actually satisfy the goal across edge cases, error paths, and unusual inputs?
   - The tests themselves — re-derive each expected value from the goal (not from the current code) and confirm the tests assert THAT; check they exercise the real required behavior rather than the implementation, and that negative / boundary / failure cases aren't missing. A green suite is NOT proof: a test can assert the wrong thing, be tautological, or be incomplete.
   - The approach — could the solution be reworked to be simpler, clearer, or more robust, and is the acceptance set itself correct and complete?
-Treat checked-off ACCEPTANCE items as re-openable: if scrutiny reveals a problem, uncheck it and add the fix to REMAINING. Reorder REMAINING by impact: correctness > security > edge cases > test coverage > performance > style.
+Record every problem you find under FINDINGS, ordered by impact: correctness > security > edge cases > test coverage > performance > style.
 
-WORK: Make as much fully-verified progress toward the goal as you can this pass. Do not artificially limit yourself to one tiny change, and do not pace yourself for future passes — but keep each change coherent and verified before moving to the next.
+WORK: Fully drive the goal to a correct, complete state now. Implement everything the goal requires that is missing or wrong, and fix every item in FINDINGS — do not stop at a single change and do not leave straightforward work unfinished. (Only if the goal is genuinely too large to finish coherently in one sitting, complete as much as you can fully verify and describe the rest precisely under FINDINGS.)
 
-VERIFY: {{verify}} Show the command and its real output — do not assert success. A criterion is done only when its check actually passes. Never edit, delete, weaken, skip, hard-code around, or add skip/xfail to a test to make it pass — fix the underlying code. If a test is genuinely wrong, leave it in place and record it under REMAINING for human review.
+VERIFY: {{verify}} Show the command and its real output — do not assert success. A criterion is satisfied only when its check actually passes. Never edit, delete, weaken, skip, hard-code around, or add skip/xfail to a test to make it pass — fix the underlying code. If a test is genuinely wrong, leave it in place and record it under FINDINGS.
 
-COMMIT: Commit the finished work with a clear message and save the updated plan to {{plan_file}} — updating checkboxes and REMAINING, but never writing an overall "complete"/"done" status.
+COMMIT: Commit the finished work with a clear message, and update {{plan_file}} — refresh the ACCEPTANCE statuses (with their evidence) and the FINDINGS list. Never record the goal itself as "complete", "done", or "finished" in the plan; that status is determined separately, not by the plan's contents.
 
-SCOPE: Do not add features, abstractions, or defensive code beyond the goal, and do not refactor code unrelated to what you are finishing.
+SCOPE: Do not add features, abstractions, or defensive code beyond the goal, and do not refactor code unrelated to what you are fixing.
 
-COMPLETION: A passing VERIFY command is necessary but NOT sufficient — green tests do not prove correctness (they can assert the wrong values, test the implementation instead of the requirement, or omit cases entirely). Never use "nothing changed since the last pass" or "it was already verified" as evidence of completeness; re-examine from scratch every pass. Before you may declare completion, perform an adversarial review of the ENTIRE diff against the base branch (e.g. ` + "`git diff`" + `) as a skeptical reviewer who did NOT write it, and confirm ALL of: (1) you independently re-derived each acceptance criterion from the goal and the tests genuinely assert it; (2) the tests cover the real behavior plus its edge and failure cases; (3) no rework would make the solution meaningfully more correct or robust; (4) the VERIFY command passes with its real output shown above. Only if all four hold and you genuinely cannot find anything to improve, output the line {{sentinel}} alone on its own line with nothing after it. If anything is uncertain or improvable — however minor — do NOT output {{sentinel}}: record it in the plan and keep working.`,
+COMPLETION: A passing VERIFY command is necessary but NOT sufficient — green tests do not prove correctness (they can assert the wrong values, test the implementation instead of the requirement, or omit cases entirely). Before signaling completion, do a final skeptical review of the ENTIRE change against the base branch (e.g. ` + "`git diff`" + `) as a reviewer who did NOT write it, and confirm ALL of: (1) you independently re-derived each acceptance criterion from the goal and the tests genuinely assert it; (2) the tests cover the real behavior plus its edge and failure cases; (3) no rework would make the solution meaningfully more correct or robust; (4) the VERIFY command passes with its real output shown above. Only if all four hold and you genuinely cannot find anything to improve, output the line {{sentinel}} alone on its own line with nothing after it. If anything is uncertain or improvable — however minor — do NOT output {{sentinel}}: fix it now, or if it is genuinely out of reach, record it under FINDINGS.`,
 		CleanupPrompt: "The Ralph loop just exited{{issue_clause}}. Perform post-loop cleanup per {{instructions_doc}}: push the branch and open a PR.{{closes_clause}}",
 		IssuePrompt:   "Work on {{provider}} issue #{{number}}. Read the title and body carefully; if your host CLI is available (`gh` or `glab`), also read the issue comments — they may contain crucial follow-up context.\n\nTitle: {{title}}\n\nBody:\n{{body}}",
 		OutputDir:     ".ralph",
 		ClaudeBin:     "claude",
+		BranchPrefix:  "ralph",
 		PollInterval:  60,
 		GitHub: GitHubConfig{
 			Labels: LabelConfig{
@@ -390,6 +404,12 @@ const starterTOML = `# go-ralph-go project config — defaults shown, uncomment 
 # claude_bin       = "claude"
 # poll_interval    = 60           # auto-mode poll seconds (min 30)
 # default_branch   = ""           # override auto-detected default branch
+# branch_prefix    = "ralph"      # namespace for the per-task branch ralph
+#                                 # creates before the loop in PR-opening modes
+#                                 # (issue/auto/run --pr): "ralph/issue-<N>-<slug>".
+#                                 # This guardrail keeps every commit + push off
+#                                 # the protected default branch. "" drops the
+#                                 # namespace ("issue-<N>-<slug>").
 
 # completion_sentinel = "RALPH_GOAL_COMPLETE"  # line Claude emits when the goal
 #                                              # is done; ends the loop.

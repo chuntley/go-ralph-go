@@ -28,6 +28,20 @@ func CheckoutMain(ctx context.Context, dir, mainBranch string) error {
 	return nil
 }
 
+// CreateWorkBranch creates (or resets) branch and checks it out, off the
+// current HEAD. Uses `git checkout -B` so a re-run of the same issue starts
+// fresh from the just-pulled default branch rather than failing on "branch
+// already exists" or resuming stale local commits — consistent with ralph's
+// fresh-context-per-cycle model. The caller is expected to have checked out and
+// fast-forwarded the default branch first (see CheckoutMain), so the new branch
+// branches from up-to-date upstream.
+func CreateWorkBranch(ctx context.Context, dir, branch string) error {
+	if _, err := run(ctx, dir, "git", "checkout", "-B", branch); err != nil {
+		return fmt.Errorf("create work branch %s: %w", branch, err)
+	}
+	return nil
+}
+
 // IsClean reports whether the working tree and index are clean.
 func IsClean(ctx context.Context, dir string) (bool, error) {
 	out, err := run(ctx, dir, "git", "status", "--porcelain")
