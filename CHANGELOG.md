@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/chuntley/go-ralph-go/compare/v0.3.0...v0.4.0) (2026-06-17)
+
+
+### Features
+
+* open the PR deterministically and harden the cleanup pass ([#20](https://github.com/chuntley/go-ralph-go/issues/20)) ([02aa770](https://github.com/chuntley/go-ralph-go/commit/02aa770aff57227eb40c33b00e9850032b566518))
+
 ## [0.3.0](https://github.com/chuntley/go-ralph-go/compare/v0.2.2...v0.3.0) (2026-06-17)
 
 
