@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"strconv"
 	"strings"
 )
 
@@ -40,6 +41,32 @@ func CreateWorkBranch(ctx context.Context, dir, branch string) error {
 		return fmt.Errorf("create work branch %s: %w", branch, err)
 	}
 	return nil
+}
+
+// Push pushes branch to origin and sets upstream. Idempotent: re-pushing an
+// already-pushed branch with no new commits is a no-op success. ralph uses this
+// to make sure a branch the agent committed to is on the remote before opening
+// a PR for it.
+func Push(ctx context.Context, dir, branch string) error {
+	if _, err := run(ctx, dir, "git", "push", "-u", "origin", branch); err != nil {
+		return fmt.Errorf("push %s: %w", branch, err)
+	}
+	return nil
+}
+
+// CommitsAhead returns how many commits branch is ahead of base (i.e. the
+// commits that would be merged), using local refs. Zero means the branch holds
+// no work to open a PR for.
+func CommitsAhead(ctx context.Context, dir, base, branch string) (int, error) {
+	out, err := run(ctx, dir, "git", "rev-list", "--count", base+".."+branch)
+	if err != nil {
+		return 0, fmt.Errorf("rev-list %s..%s: %w", base, branch, err)
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(out))
+	if err != nil {
+		return 0, fmt.Errorf("parse commit count %q: %w", strings.TrimSpace(out), err)
+	}
+	return n, nil
 }
 
 // IsClean reports whether the working tree and index are clean.

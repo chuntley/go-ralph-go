@@ -79,8 +79,7 @@ func joinBranchPrefix(prefix, base string) string {
 func branchContextNote(branch, defaultBranch string) string {
 	return fmt.Sprintf(
 		"You are already on a dedicated git branch for this task: `%s` (created from `%s`). "+
-			"Make ALL commits on this branch. Do NOT switch to, commit to, or push `%s` — "+
-			"ralph opens the pull request from your branch after the loop finishes.",
+			"Make ALL commits on this branch. Do NOT switch to, commit to, or push `%s`.",
 		branch, defaultBranch, defaultBranch,
 	)
 }

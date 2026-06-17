@@ -26,6 +26,12 @@ type fakeProvider struct {
 	// the historic dispatchCleanup tests untouched.
 	findPRResult *vcs.PR
 	findPRError  error
+
+	// CreatePR recording + configurable error, for the ensurePR fallback tests.
+	createdPR     *vcs.PR
+	createPRTitle string
+	createPRBody  string
+	createPRError error
 }
 
 func (f *fakeProvider) Name() string                                   { return "fake" }
@@ -50,6 +56,12 @@ func (f *fakeProvider) MarkResolved(_ context.Context, n int, _ vcs.Labels) erro
 }
 func (f *fakeProvider) FindPRForBranch(context.Context, string) (*vcs.PR, error) {
 	return f.findPRResult, f.findPRError
+}
+func (f *fakeProvider) CreatePR(_ context.Context, head, base, title, body string) (*vcs.PR, error) {
+	f.createdPR = &vcs.PR{Number: 999, Branch: head, URL: "https://example.test/pr/999"}
+	f.createPRTitle = title
+	f.createPRBody = body
+	return f.createdPR, f.createPRError
 }
 func (f *fakeProvider) WaitForChecks(context.Context, int, time.Duration) error { return nil }
 func (f *fakeProvider) SquashMergeAndDelete(context.Context, int) error         { return nil }
