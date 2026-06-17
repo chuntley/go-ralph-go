@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/chuntley/go-ralph-go/compare/v0.2.2...v0.3.0) (2026-06-17)
+
+
+### Features
+
+* branch guardrail + auth preflight for safer auto runs ([#18](https://github.com/chuntley/go-ralph-go/issues/18)) ([828685d](https://github.com/chuntley/go-ralph-go/commit/828685d4a0aef2be88fcf14c9bcc19a75d68f3cc))
+
 ## [0.2.2](https://github.com/chuntley/go-ralph-go/compare/v0.2.1...v0.2.2) (2026-06-09)
 
 
