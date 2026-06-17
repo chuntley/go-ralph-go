@@ -175,6 +175,61 @@ func TestCreateWorkBranchResetsExistingBranch(t *testing.T) {
 	}
 }
 
+func TestCommitsAheadCountsBranchCommits(t *testing.T) {
+	dir := initRepo(t, "main")
+	mustGit(t, dir, "checkout", "-b", "feature")
+	// No commits yet → 0 ahead.
+	n, err := CommitsAhead(context.Background(), dir, "main", "feature")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("fresh branch: got %d ahead, want 0", n)
+	}
+	// Two commits → 2 ahead.
+	for i, name := range []string{"a.txt", "b.txt"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		mustGit(t, dir, "add", ".")
+		mustGit(t, dir, "commit", "-m", "c"+string(rune('0'+i)))
+	}
+	n, err = CommitsAhead(context.Background(), dir, "main", "feature")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Errorf("got %d ahead, want 2", n)
+	}
+}
+
+func TestPushSendsBranchToOrigin(t *testing.T) {
+	bare := t.TempDir()
+	mustGit(t, bare, "init", "--bare", "-b", "main")
+	dir := initRepo(t, "main")
+	mustGit(t, dir, "remote", "add", "origin", bare)
+	mustGit(t, dir, "checkout", "-b", "feature")
+	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, dir, "add", ".")
+	mustGit(t, dir, "commit", "-m", "work")
+
+	if err := Push(context.Background(), dir, "feature"); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	// The bare origin should now have the feature ref.
+	cmd := exec.Command("git", "rev-parse", "--verify", "feature")
+	cmd.Dir = bare
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Errorf("feature branch not on origin after Push: %v\n%s", err, out)
+	}
+	// Idempotent: pushing again with no new commits is still a success.
+	if err := Push(context.Background(), dir, "feature"); err != nil {
+		t.Errorf("re-Push should be a no-op success: %v", err)
+	}
+}
+
 func TestDefaultBranchPrefersOriginHEAD(t *testing.T) {
 	// Make a "remote" bare repo with develop as default, clone it, verify we
 	// pick up develop via symbolic-ref of refs/remotes/origin/HEAD.

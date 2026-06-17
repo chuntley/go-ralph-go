@@ -182,6 +182,19 @@ func (p *Provider) FindPRForBranch(ctx context.Context, branch string) (*vcs.PR,
 	return &vcs.PR{Number: int(mrs[0].IID), Branch: branch, URL: mrs[0].WebURL}, nil
 }
 
+func (p *Provider) CreatePR(ctx context.Context, headBranch, baseBranch, title, body string) (*vcs.PR, error) {
+	mr, _, err := p.client.MergeRequests.CreateMergeRequest(p.project, &gl.CreateMergeRequestOptions{
+		SourceBranch: &headBranch,
+		TargetBranch: &baseBranch,
+		Title:        &title,
+		Description:  &body,
+	}, gl.WithContext(ctx))
+	if err != nil {
+		return nil, fmt.Errorf("create MR: %w", err)
+	}
+	return &vcs.PR{Number: int(mr.IID), Branch: headBranch, URL: mr.WebURL}, nil
+}
+
 // minConfirmZeroPipelines is the number of consecutive polls returning a nil
 // HeadPipeline before WaitForChecks concludes "this repo has no CI". Without
 // this, GitLab's pipeline-registration delay could cause premature merges.
@@ -238,7 +251,7 @@ func (p *Provider) SquashMergeAndDelete(ctx context.Context, prNumber int) error
 	squash := true
 	delBr := true
 	_, _, err := p.client.MergeRequests.AcceptMergeRequest(p.project, int64(prNumber), &gl.AcceptMergeRequestOptions{
-		Squash:              &squash,
+		Squash:                   &squash,
 		ShouldRemoveSourceBranch: &delBr,
 	}, gl.WithContext(ctx))
 	if err != nil {

@@ -192,7 +192,7 @@ COMMIT: Commit the finished work with a clear message, and update {{plan_file}} 
 SCOPE: Do not add features, abstractions, or defensive code beyond the goal, and do not refactor code unrelated to what you are fixing.
 
 COMPLETION: A passing VERIFY command is necessary but NOT sufficient — green tests do not prove correctness (they can assert the wrong values, test the implementation instead of the requirement, or omit cases entirely). Before signaling completion, do a final skeptical review of the ENTIRE change against the base branch (e.g. ` + "`git diff`" + `) as a reviewer who did NOT write it, and confirm ALL of: (1) you independently re-derived each acceptance criterion from the goal and the tests genuinely assert it; (2) the tests cover the real behavior plus its edge and failure cases; (3) no rework would make the solution meaningfully more correct or robust; (4) the VERIFY command passes with its real output shown above. Only if all four hold and you genuinely cannot find anything to improve, output the line {{sentinel}} alone on its own line with nothing after it. If anything is uncertain or improvable — however minor — do NOT output {{sentinel}}: fix it now, or if it is genuinely out of reach, record it under FINDINGS.`,
-		CleanupPrompt: "The Ralph loop just exited{{issue_clause}}. Perform post-loop cleanup per {{instructions_doc}}: push the branch and open a PR.{{closes_clause}}",
+		CleanupPrompt: "The Ralph loop just exited{{issue_clause}}. This is a single, non-interactive cleanup turn: there is no later turn, and any process you start in the background is killed the moment this turn ends. Do everything now, in the foreground, and finish before you end this response. Per {{instructions_doc}}, commit anything still outstanding, push the branch, and open a PR. Do NOT run verification (tests, builds, lint) or any other work in the background, and do NOT defer the push until after something else finishes — if you want to run checks first, run them synchronously now, then push and open the PR in this same response.{{closes_clause}}",
 		IssuePrompt:   "Work on {{provider}} issue #{{number}}. Read the title and body carefully; if your host CLI is available (`gh` or `glab`), also read the issue comments — they may contain crucial follow-up context.\n\nTitle: {{title}}\n\nBody:\n{{body}}",
 		OutputDir:     ".ralph",
 		ClaudeBin:     "claude",
@@ -419,7 +419,13 @@ const starterTOML = `# go-ralph-go project config — defaults shown, uncomment 
 # the loop if it exits 0. This is the robust defense against premature "done" /
 # reward-hacking: the real test suite, run by ralph, gets the final say. Highly
 # recommended. Empty (default) = trust the signal as-is, with a logged caveat.
-# verify_command = "go test ./... && go build ./... && golangci-lint run"
+#
+# Best practice: point this at a SINGLE source of truth your CI also runs (a
+# "make verify", "bun run verify", "./scripts/verify.sh", etc.) rather than
+# spelling the steps out here — otherwise this gate silently drifts from what
+# the project actually checks. Define the checklist once in the repo; reference
+# it from both CI and ralph.
+# verify_command = "make verify"     # or "bun run verify", "./scripts/verify.sh"
 
 # Opt in to a project-local CLAUDE_CONFIG_DIR. Empty (default) = use the
 # system-wide claude install — which is almost always what you want.
@@ -449,8 +455,11 @@ const starterTOML = `# go-ralph-go project config — defaults shown, uncomment 
 # """
 
 # cleanup_prompt = """
-# The Ralph loop just exited{{issue_clause}}. Perform post-loop cleanup per
-# {{instructions_doc}}: push the branch and open a PR.{{closes_clause}}
+# The Ralph loop just exited{{issue_clause}}. This is a single, non-interactive
+# cleanup turn — there is no later turn and background tasks are killed when it
+# ends. Do everything now, in the foreground: per {{instructions_doc}}, commit
+# anything outstanding, push the branch, and open a PR before ending this
+# response. Do not run verification in the background or defer the push.{{closes_clause}}
 # """
 
 # [github]

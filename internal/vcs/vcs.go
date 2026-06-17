@@ -76,6 +76,13 @@ type Provider interface {
 	// FindPRForBranch returns the open PR/MR for the given source branch, if any.
 	FindPRForBranch(ctx context.Context, branch string) (*PR, error)
 
+	// CreatePR opens a pull/merge request from headBranch into baseBranch with
+	// the given title and body, returning the created PR. ralph uses this as a
+	// fallback when the cleanup pass committed and pushed work but did not open
+	// the PR itself — so the run doesn't fail just because the agent ran out of
+	// turn. headBranch must already exist on the remote.
+	CreatePR(ctx context.Context, headBranch, baseBranch, title, body string) (*PR, error)
+
 	// WaitForChecks blocks until all required checks finish, returning nil on
 	// success or an error describing the failure. Polling cadence is up to
 	// the implementation; interval is a suggestion.

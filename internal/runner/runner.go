@@ -66,7 +66,7 @@ func RunPrompt(ctx context.Context, cfg *config.Config, prompt string, openPR bo
 		r.log("Prompt mode complete; not opening a PR.")
 		return nil
 	}
-	return r.handleCleanupPR(ctx, 0)
+	return r.handleCleanupPR(ctx, 0, "")
 }
 
 // RunIssue works a single issue end-to-end: loop, cleanup, PR, checks, merge.
@@ -339,7 +339,7 @@ func (r *run) processIssue(ctx context.Context, issueNum int) (resultErr error) 
 	if err := r.cycle(ctx, workPrompt, cleanupPrompt); err != nil {
 		return err
 	}
-	return r.handleCleanupPR(ctx, issueNum)
+	return r.handleCleanupPR(ctx, issueNum, issue.Title)
 }
 
 // resolveDefaultBranch honours an explicit cfg.DefaultBranch first, then falls
@@ -557,29 +557,29 @@ func renderRefinePrompt(cfg *config.Config, planFile string) string {
 	return r.Replace(cfg.RefinePrompt)
 }
 
-// handleCleanupPR locates the branch Claude pushed, finds the open PR/MR for
-// it, waits for checks, and squash-merges. For ad-hoc prompts (issueNum=0)
-// only the PR existence check runs.
-func (r *run) handleCleanupPR(ctx context.Context, issueNum int) error {
+// handleCleanupPR locates the branch the loop worked on and ensures an open
+// PR/MR exists for it — opening one itself if the cleanup pass didn't (see
+// ensurePR) — then for issue mode waits for checks and squash-merges. For
+// ad-hoc prompts (issueNum=0) it stops after ensuring the PR (no auto-merge).
+// issueTitle, when non-empty, seeds the title of any PR ralph has to open.
+func (r *run) handleCleanupPR(ctx context.Context, issueNum int, issueTitle string) error {
 	branch, err := git.CurrentBranch(ctx, r.cfg.ProjectRoot)
 	if err != nil {
 		return fmt.Errorf("detect branch: %w", err)
 	}
 	defaultBranch := r.resolveDefaultBranch(ctx)
 	if branch == defaultBranch {
-		return fmt.Errorf("cleanup pass left us on %s — Claude did not create a feature branch", defaultBranch)
+		return fmt.Errorf("cleanup pass left us on %s — no feature branch to open a PR from (ralph creates one before the loop; the agent must not check out %s)", defaultBranch, defaultBranch)
+	}
+
+	pr, err := r.ensurePR(ctx, branch, defaultBranch, issueNum, issueTitle)
+	if err != nil {
+		return err
 	}
 
 	if issueNum == 0 {
-		// Ad-hoc --pr mode: PR opened but NOT auto-merged.
-		pr, err := r.provider.FindPRForBranch(ctx, branch)
-		if err != nil {
-			return fmt.Errorf("find PR: %w", err)
-		}
-		if pr == nil {
-			return fmt.Errorf("no open PR found for branch %s — Claude may have committed but not pushed; check `git log` and re-run with --pr or push manually", branch)
-		}
-		r.log(fmt.Sprintf("Opened PR #%d on branch %s (no auto-merge).", pr.Number, branch))
+		// Ad-hoc --pr mode: PR ensured but NOT auto-merged.
+		r.log(fmt.Sprintf("PR #%d ready on branch %s (no auto-merge).", pr.Number, branch))
 		if pr.URL != "" {
 			r.log("  → " + pr.URL)
 		}
@@ -587,16 +587,8 @@ func (r *run) handleCleanupPR(ctx context.Context, issueNum int) error {
 		return nil
 	}
 
-	pr, err := r.provider.FindPRForBranch(ctx, branch)
-	if err != nil {
-		return fmt.Errorf("find PR: %w", err)
-	}
-	if pr == nil {
-		return fmt.Errorf("no open PR for branch %s — refine loop did not push a PR", branch)
-	}
-
 	if pr.URL != "" {
-		r.log(fmt.Sprintf("Found PR #%d  →  %s", pr.Number, pr.URL))
+		r.log(fmt.Sprintf("PR #%d  →  %s", pr.Number, pr.URL))
 	}
 	r.log(fmt.Sprintf("Waiting for checks on PR #%d...", pr.Number))
 	interval := time.Duration(r.cfg.GitHub.CheckIntervalSeconds) * time.Second
@@ -618,6 +610,55 @@ func (r *run) handleCleanupPR(ctx context.Context, issueNum int) error {
 	}
 	_ = git.CheckoutMain(ctx, r.cfg.ProjectRoot, defaultBranch)
 	return nil
+}
+
+// ensurePR returns the open PR/MR for branch, opening one itself if the cleanup
+// pass didn't. This is the deterministic complement to the branch guardrail:
+// ralph owns the git/PR mechanics so a run never fails merely because the agent
+// committed but ran out of turn before pushing or opening the PR (e.g. it
+// backgrounded a long test gate). When no PR exists ralph pushes the branch and
+// opens the PR; if the branch carries no commits over base there is genuinely
+// nothing to do, so it surfaces that clearly instead of opening an empty PR.
+func (r *run) ensurePR(ctx context.Context, branch, baseBranch string, issueNum int, issueTitle string) (*vcs.PR, error) {
+	pr, err := r.provider.FindPRForBranch(ctx, branch)
+	if err != nil {
+		return nil, fmt.Errorf("find PR: %w", err)
+	}
+	if pr != nil {
+		return pr, nil
+	}
+
+	// No PR yet — the cleanup pass committed work but didn't open one. Confirm
+	// there is actually work to merge before doing anything remote.
+	if ahead, err := git.CommitsAhead(ctx, r.cfg.ProjectRoot, baseBranch, branch); err == nil && ahead == 0 {
+		return nil, fmt.Errorf("branch %s has no commits over %s — the loop produced no changes to open a PR for", branch, baseBranch)
+	}
+	r.log(fmt.Sprintf("No PR found for branch %s — pushing and opening one.", branch))
+	if err := git.Push(ctx, r.cfg.ProjectRoot, branch); err != nil {
+		return nil, err
+	}
+	title, body := ralphPRContent(issueNum, issueTitle, branch)
+	pr, err = r.provider.CreatePR(ctx, branch, baseBranch, title, body)
+	if err != nil {
+		return nil, fmt.Errorf("open PR for branch %s: %w", branch, err)
+	}
+	r.log(fmt.Sprintf("Opened PR #%d (ralph fallback — cleanup pass did not open it).", pr.Number))
+	return pr, nil
+}
+
+// ralphPRContent builds the title/body for a PR ralph opens as a fallback. For
+// an issue it seeds the title from the issue and embeds "Closes #N" so the
+// merge auto-closes it; for an ad-hoc run it names the branch.
+func ralphPRContent(issueNum int, issueTitle, branch string) (title, body string) {
+	const note = "🤖 Opened by ralph after the loop: the cleanup pass committed work but did not open a PR itself."
+	if issueNum > 0 {
+		title = issueTitle
+		if title == "" {
+			title = fmt.Sprintf("Resolve issue #%d", issueNum)
+		}
+		return title, fmt.Sprintf("Closes #%d\n\n%s", issueNum, note)
+	}
+	return fmt.Sprintf("ralph: %s", branch), note
 }
 
 // renderCleanup expands the cleanup template, filling {{instructions_doc}},

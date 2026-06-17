@@ -35,6 +35,28 @@ func initRepoOnBranch(t *testing.T, branch, featureBranch string) string {
 	return dir
 }
 
+// initRepoWithOriginAndFeature sets up a work repo wired to a bare `origin`,
+// then checks out featureBranch with ONE commit ahead of the default branch —
+// the state ensurePR's fallback needs (a real remote to push to and commits to
+// open a PR for).
+func initRepoWithOriginAndFeature(t *testing.T, branch, featureBranch string) string {
+	t.Helper()
+	bare := t.TempDir()
+	mustGitCmd(t, bare, "init", "--bare", "-b", branch)
+
+	dir := initRepoOnBranch(t, branch, "")
+	mustGitCmd(t, dir, "remote", "add", "origin", bare)
+	mustGitCmd(t, dir, "push", "-u", "origin", branch)
+
+	mustGitCmd(t, dir, "checkout", "-b", featureBranch)
+	if err := os.WriteFile(filepath.Join(dir, "feature.txt"), []byte("work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGitCmd(t, dir, "add", ".")
+	mustGitCmd(t, dir, "commit", "-m", "feature work")
+	return dir
+}
+
 func mustGitCmd(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", args...)
@@ -45,95 +67,15 @@ func mustGitCmd(t *testing.T, dir string, args ...string) {
 }
 
 // newRunForTest builds a *run without going through newRun() (which requires
-// the claude binary on PATH). Session is intentionally left nil — every test
-// path below errors out *before* any r.log / r.section call, so the nil
-// session never gets dereferenced. Add a real session if you exercise the
-// success path.
-func newRunForTest(projectRoot, defaultBranch string, prov vcs.Provider) *run {
+// the claude binary on PATH). A discard-backed Session is attached so the
+// r.log calls on the success / fallback paths have somewhere to write.
+func newRunForTest(t *testing.T, projectRoot, defaultBranch string, prov vcs.Provider) *run {
+	t.Helper()
 	cfg := config.Defaults()
 	cfg.ProjectRoot = projectRoot
 	cfg.DefaultBranch = defaultBranch
-	return &run{
-		cfg:      &cfg,
-		provider: prov,
-		ui:       io.Discard,
-	}
-}
-
-// TestHandleCleanupPRErrorsIfStuckOnDefaultBranch — if Claude's cleanup pass
-// finished without creating a feature branch (still on main), handleCleanupPR
-// must surface a clear error rather than try to look up "main" as a PR head.
-func TestHandleCleanupPRErrorsIfStuckOnDefaultBranch(t *testing.T) {
-	dir := initRepoOnBranch(t, "main", "") // stay on main
-	r := newRunForTest(dir, "main", &fakeProvider{})
-
-	err := r.handleCleanupPR(context.Background(), 0)
-	if err == nil {
-		t.Fatal("expected error when cleanup left us on the default branch")
-	}
-	if !strings.Contains(err.Error(), "did not create a feature branch") {
-		t.Errorf("error should explain the problem; got: %v", err)
-	}
-}
-
-// TestHandleCleanupPRAdHocModeRequiresAnOpenPR — in `ralph run --pr` mode the
-// cleanup pass is supposed to open a PR. If FindPRForBranch returns no PR,
-// surface an actionable error mentioning the branch so the user can recover.
-func TestHandleCleanupPRAdHocModeRequiresAnOpenPR(t *testing.T) {
-	dir := initRepoOnBranch(t, "main", "feature/x")
-	prov := &fakeProvider{findPRResult: nil} // simulate "Claude didn't push a PR"
-	r := newRunForTest(dir, "main", prov)
-
-	err := r.handleCleanupPR(context.Background(), 0)
-	if err == nil {
-		t.Fatal("expected error when no PR was opened in --pr mode")
-	}
-	if !strings.Contains(err.Error(), "feature/x") {
-		t.Errorf("error should mention the branch name to aid recovery; got: %v", err)
-	}
-	if !strings.Contains(err.Error(), "no open PR") {
-		t.Errorf("error should explain that no PR was found; got: %v", err)
-	}
-}
-
-// TestHandleCleanupPRIssueModeRequiresAnOpenPR — in issue mode, a missing PR
-// means the refine loop never pushed. Bubble that up so processIssue's defer
-// marks the issue failed instead of silently merging nothing.
-func TestHandleCleanupPRIssueModeRequiresAnOpenPR(t *testing.T) {
-	dir := initRepoOnBranch(t, "main", "feature/y")
-	prov := &fakeProvider{findPRResult: nil}
-	r := newRunForTest(dir, "main", prov)
-
-	err := r.handleCleanupPR(context.Background(), 42)
-	if err == nil {
-		t.Fatal("expected error when no PR exists for issue mode")
-	}
-	if !strings.Contains(err.Error(), "feature/y") {
-		t.Errorf("error should mention the branch name; got: %v", err)
-	}
-	if !strings.Contains(err.Error(), "did not push") {
-		t.Errorf("error should explain the loop failed to push; got: %v", err)
-	}
-}
-
-// TestHandleCleanupPRIssueModeSuccessCallsMarkResolved — the happy path: PR
-// found, checks pass, merge succeeds, MarkResolved fires. The MarkResolved
-// call is the defensive backstop that closes the issue + clears the working
-// label even when Claude's PR body forgot to include "Closes #N"; without it
-// the issue would stay open with ralph-working set forever.
-func TestHandleCleanupPRIssueModeSuccessCallsMarkResolved(t *testing.T) {
-	dir := initRepoOnBranch(t, "main", "feature/z")
-	prov := &fakeProvider{
-		findPRResult: &vcs.PR{Number: 7, Branch: "feature/z", URL: "https://example.test/pull/7"},
-	}
-	r := newRunForTest(dir, "main", prov)
-
-	// handleCleanupPR's success path calls r.log, which writes through the
-	// session. Wire a real Session backed by t.TempDir() so the writes have
-	// somewhere to land — NewSession does not require the claude binary, it
-	// only generates a UUID and stores config.
 	sess, err := claude.NewSession(claude.SessionConfig{
-		WorkDir:   dir,
+		WorkDir:   projectRoot,
 		OutputDir: filepath.Join(t.TempDir(), ".ralph"),
 		UI:        io.Discard,
 	})
@@ -141,10 +83,114 @@ func TestHandleCleanupPRIssueModeSuccessCallsMarkResolved(t *testing.T) {
 		t.Fatalf("NewSession: %v", err)
 	}
 	t.Cleanup(func() { _ = sess.Close() })
-	r.session = sess
+	return &run{
+		cfg:      &cfg,
+		provider: prov,
+		session:  sess,
+		ui:       io.Discard,
+	}
+}
 
-	if err := r.handleCleanupPR(context.Background(), 42); err != nil {
+// TestHandleCleanupPRErrorsIfStuckOnDefaultBranch — if the cleanup pass finished
+// on the default branch (the agent ignored its branch and checked out main),
+// handleCleanupPR must surface a clear error rather than try to open a PR from
+// the default branch.
+func TestHandleCleanupPRErrorsIfStuckOnDefaultBranch(t *testing.T) {
+	dir := initRepoOnBranch(t, "main", "") // stay on main
+	r := newRunForTest(t, dir, "main", &fakeProvider{})
+
+	err := r.handleCleanupPR(context.Background(), 0, "")
+	if err == nil {
+		t.Fatal("expected error when cleanup left us on the default branch")
+	}
+	if !strings.Contains(err.Error(), "no feature branch") {
+		t.Errorf("error should explain the problem; got: %v", err)
+	}
+}
+
+// TestHandleCleanupPRErrorsWhenBranchHasNoCommits — on a feature branch with no
+// commits over the base and no PR, there is genuinely nothing to open a PR for.
+// ensurePR must say so (and must NOT attempt a push — there's no origin here).
+func TestHandleCleanupPRErrorsWhenBranchHasNoCommits(t *testing.T) {
+	dir := initRepoOnBranch(t, "main", "feature/empty") // branched, no extra commit
+	prov := &fakeProvider{findPRResult: nil}
+	r := newRunForTest(t, dir, "main", prov)
+
+	err := r.handleCleanupPR(context.Background(), 42, "Fix the thing")
+	if err == nil {
+		t.Fatal("expected error when the branch carries no work")
+	}
+	if !strings.Contains(err.Error(), "no commits over") {
+		t.Errorf("error should explain there's nothing to PR; got: %v", err)
+	}
+	if prov.createdPR != nil {
+		t.Error("must not open a PR for an empty branch")
+	}
+}
+
+// TestHandleCleanupPROpensPRWhenMissingIssueMode — the core guardrail: the loop
+// committed work on the branch but the cleanup pass never opened a PR. ralph
+// must push the branch, open the PR itself (with Closes #N), then merge and
+// resolve — instead of failing the issue.
+func TestHandleCleanupPROpensPRWhenMissingIssueMode(t *testing.T) {
+	dir := initRepoWithOriginAndFeature(t, "main", "ralph/issue-42-x")
+	prov := &fakeProvider{findPRResult: nil} // no PR opened by the agent
+	r := newRunForTest(t, dir, "main", prov)
+
+	if err := r.handleCleanupPR(context.Background(), 42, "Fix the thing"); err != nil {
+		t.Fatalf("expected ralph to open the PR and succeed, got: %v", err)
+	}
+	if prov.createdPR == nil {
+		t.Fatal("ralph should have opened a PR when none existed")
+	}
+	if prov.createPRTitle != "Fix the thing" {
+		t.Errorf("PR title = %q; want the issue title", prov.createPRTitle)
+	}
+	if !strings.Contains(prov.createPRBody, "Closes #42") {
+		t.Errorf("PR body should auto-close the issue; got: %q", prov.createPRBody)
+	}
+	if prov.resolved != 42 {
+		t.Errorf("MarkResolved should fire after merge (resolved=%d)", prov.resolved)
+	}
+}
+
+// TestHandleCleanupPROpensPRWhenMissingAdHoc — `run --pr` with no PR: ralph
+// opens one but does NOT merge it.
+func TestHandleCleanupPROpensPRWhenMissingAdHoc(t *testing.T) {
+	dir := initRepoWithOriginAndFeature(t, "main", "ralph/run-x")
+	prov := &fakeProvider{findPRResult: nil}
+	r := newRunForTest(t, dir, "main", prov)
+
+	if err := r.handleCleanupPR(context.Background(), 0, ""); err != nil {
+		t.Fatalf("expected ralph to open the PR and succeed, got: %v", err)
+	}
+	if prov.createdPR == nil {
+		t.Fatal("ralph should have opened a PR when none existed")
+	}
+	if prov.createPRTitle != "ralph: ralph/run-x" {
+		t.Errorf("ad-hoc PR title = %q; want branch-derived title", prov.createPRTitle)
+	}
+	if prov.resolved != 0 {
+		t.Error("ad-hoc --pr must NOT merge/resolve")
+	}
+}
+
+// TestHandleCleanupPRIssueModeSuccessCallsMarkResolved — the happy path when the
+// agent DID open the PR: checks pass, merge succeeds, MarkResolved fires (the
+// defensive backstop that closes the issue + clears ralph-working even when the
+// PR body lacked "Closes #N").
+func TestHandleCleanupPRIssueModeSuccessCallsMarkResolved(t *testing.T) {
+	dir := initRepoOnBranch(t, "main", "feature/z")
+	prov := &fakeProvider{
+		findPRResult: &vcs.PR{Number: 7, Branch: "feature/z", URL: "https://example.test/pull/7"},
+	}
+	r := newRunForTest(t, dir, "main", prov)
+
+	if err := r.handleCleanupPR(context.Background(), 42, "Fix the thing"); err != nil {
 		t.Fatalf("expected success, got: %v", err)
+	}
+	if prov.createdPR != nil {
+		t.Error("must not open a new PR when one already exists")
 	}
 	if prov.resolved != 42 {
 		t.Errorf("MarkResolved was not called for issue 42 (resolved=%d) — without this, the merged issue would stay open with ralph-working set", prov.resolved)

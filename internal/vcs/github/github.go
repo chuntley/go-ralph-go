@@ -197,8 +197,8 @@ func (p *Provider) removeLabel(ctx context.Context, n int, name string) error {
 func (p *Provider) FindPRForBranch(ctx context.Context, branch string) (*vcs.PR, error) {
 	head := fmt.Sprintf("%s:%s", p.owner, branch)
 	prs, _, err := p.client.PullRequests.List(ctx, p.owner, p.repo, &gh.PullRequestListOptions{
-		State: "open",
-		Head:  head,
+		State:       "open",
+		Head:        head,
 		ListOptions: gh.ListOptions{PerPage: 1},
 	})
 	if err != nil {
@@ -208,6 +208,20 @@ func (p *Provider) FindPRForBranch(ctx context.Context, branch string) (*vcs.PR,
 		return nil, nil
 	}
 	return &vcs.PR{Number: prs[0].GetNumber(), Branch: branch, URL: prs[0].GetHTMLURL()}, nil
+}
+
+func (p *Provider) CreatePR(ctx context.Context, headBranch, baseBranch, title, body string) (*vcs.PR, error) {
+	npr := &gh.NewPullRequest{
+		Title: &title,
+		Head:  &headBranch,
+		Base:  &baseBranch,
+		Body:  &body,
+	}
+	pr, _, err := p.client.PullRequests.Create(ctx, p.owner, p.repo, npr)
+	if err != nil {
+		return nil, fmt.Errorf("create PR: %w", err)
+	}
+	return &vcs.PR{Number: pr.GetNumber(), Branch: headBranch, URL: pr.GetHTMLURL()}, nil
 }
 
 // minConfirmZeroChecks is the number of consecutive polls returning zero
