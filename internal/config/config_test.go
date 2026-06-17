@@ -142,6 +142,9 @@ func TestDefaultsMatchDocumentation(t *testing.T) {
 	if c.ClaudeBin != "claude" {
 		t.Errorf("ClaudeBin default: got %q, want %q", c.ClaudeBin, "claude")
 	}
+	if c.BranchPrefix != "ralph" {
+		t.Errorf("BranchPrefix default: got %q, want %q", c.BranchPrefix, "ralph")
+	}
 	if c.PollInterval != 60 {
 		t.Errorf("PollInterval default: got %d, want 60", c.PollInterval)
 	}

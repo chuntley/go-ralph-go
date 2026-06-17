@@ -136,6 +136,48 @@ func TestLogPermissionsTightenOnUpgradePath(t *testing.T) {
 	}
 }
 
+// TestStartFreshRotatesIDWithoutTruncatingLogs verifies that StartFresh gives
+// the next Run a brand-new session (so it uses --session-id, not --resume) but
+// — unlike Reset — leaves the accumulating transcript intact.
+func TestStartFreshRotatesIDWithoutTruncatingLogs(t *testing.T) {
+	dir := t.TempDir()
+	sess, err := NewSession(SessionConfig{
+		Bin:       "claude",
+		WorkDir:   dir,
+		OutputDir: filepath.Join(dir, ".ralph"),
+	})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	t.Cleanup(func() { _ = sess.Close() })
+
+	// Simulate a session that has already run a turn, with content in the logs.
+	sess.started = true
+	if err := sess.WriteBanner("prior pass content\n"); err != nil {
+		t.Fatalf("WriteBanner: %v", err)
+	}
+	prevID := sess.ID()
+
+	if err := sess.StartFresh(); err != nil {
+		t.Fatalf("StartFresh: %v", err)
+	}
+	if sess.ID() == prevID {
+		t.Error("StartFresh did not rotate the session id — next Run would --resume")
+	}
+	if sess.started {
+		t.Error("StartFresh did not clear started — next Run would --resume instead of --session-id")
+	}
+	// Logs must be preserved (NOT truncated), so the operator transcript keeps
+	// accumulating across fresh passes.
+	st, err := os.Stat(filepath.Join(dir, ".ralph", "output.txt"))
+	if err != nil {
+		t.Fatalf("stat pretty log: %v", err)
+	}
+	if st.Size() == 0 {
+		t.Error("StartFresh truncated the transcript; it must be preserved")
+	}
+}
+
 // TestLastTurnTextCapturesAssistantProse verifies that writeEvent accumulates
 // streamed assistant text (and only that) into the turn buffer the runner scans
 // for a completion signal. Tool I/O must be excluded so a tool echoing the

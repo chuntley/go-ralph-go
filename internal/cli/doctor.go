@@ -31,6 +31,7 @@ func newDoctorCmd() *cobra.Command {
 // inaccessible).
 func runDoctor(ctx context.Context, out io.Writer) error {
 	fmt.Fprintln(out, "ralph doctor")
+	fmt.Fprintf(out, "         version      : %s\n", resolveVersion())
 	fmt.Fprintln(out)
 
 	// 1. Config
@@ -76,8 +77,10 @@ func runDoctor(ctx context.Context, out io.Writer) error {
 	// credentials live in the Keychain, not a .credentials.json file, so a file
 	// check would be unreliable.
 	authHint := "claude auth login"
+	statusHint := "claude auth status"
 	if effCfgDir != "" {
 		authHint = fmt.Sprintf("CLAUDE_CONFIG_DIR=%q claude auth login", effCfgDir)
+		statusHint = fmt.Sprintf("CLAUDE_CONFIG_DIR=%q claude auth status", effCfgDir)
 	}
 	switch st, ok := claude.QueryAuthStatus(cfg.ClaudeBin, effCfgDir); {
 	case ok && st.LoggedIn:
@@ -89,11 +92,17 @@ func runDoctor(ctx context.Context, out io.Writer) error {
 	case ok && !st.LoggedIn:
 		fmt.Fprintf(out, "  [WARN] claude auth : NOT logged in for this config dir — run `%s`\n", authHint)
 	default:
-		// Couldn't run `claude auth status`; fall back to .claude.json metadata.
+		// Couldn't run `claude auth status` (older claude, transient failure, or a
+		// denied keychain prompt). Fall back to .claude.json metadata — but flag it
+		// as a WARN, never an OK: that metadata is just a cached account label, NOT
+		// proof of a usable login. A project-local config dir can carry the
+		// metadata while having no credential at all (the classic onboarding
+		// footgun), so tell the operator to verify before trusting it.
 		if acct := claude.LoadAccount(effCfgDir); !acct.Empty() {
-			fmt.Fprintf(out, "         claude auth : (status unavailable; metadata says %s)\n", acct.Label())
+			fmt.Fprintf(out, "  [WARN] claude auth : could not verify login; .claude.json metadata says %s\n", acct.Label())
+			fmt.Fprintf(out, "                       metadata is NOT a login — confirm with `%s` (then `%s` if needed)\n", statusHint, authHint)
 		} else {
-			fmt.Fprintln(out, "         claude auth : (status unavailable)")
+			fmt.Fprintf(out, "  [WARN] claude auth : could not verify login — confirm with `%s`\n", statusHint)
 		}
 	}
 

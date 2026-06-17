@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/chuntley/go-ralph-go/internal/claude"
 	"github.com/chuntley/go-ralph-go/internal/vcs"
 )
 
@@ -80,6 +81,29 @@ func TestCleanupDispatchOtherErrorMarksFailed(t *testing.T) {
 	}
 	if p.failedReason == "" {
 		t.Errorf("expected failure reason to be posted")
+	}
+}
+
+func TestCleanupDispatchNotLoggedInRequeues(t *testing.T) {
+	// A claude auth failure is a local environment problem, not the issue's
+	// fault. The issue must be requeued (returned to the ready queue), NOT burned
+	// into the failed pile with a public failure comment.
+	p := &fakeProvider{}
+	dispatchCleanup(p, 13, vcs.Labels{}, fmt.Errorf("pass 1: %w", claude.ErrNotLoggedIn))
+	if p.requeued != 13 {
+		t.Errorf("expected requeue of issue 13 on auth failure, got requeued=%d", p.requeued)
+	}
+	if p.failedReason != "" {
+		t.Errorf("auth failure must NOT mark the issue failed, got reason %q", p.failedReason)
+	}
+}
+
+func TestAutoHaltReasonNoHaltOnNotLoggedIn(t *testing.T) {
+	// Mirrors dispatchCleanup: the issue was requeued, so this classifier does
+	// not produce a "labelled failed" halt. RunAuto halts the worker with the
+	// auth fix explicitly, before calling autoHaltReason.
+	if halt := autoHaltReason(1, "ralph-failed", fmt.Errorf("pass 1: %w", claude.ErrNotLoggedIn)); halt != nil {
+		t.Errorf("auth failure must not halt-as-failed (issue requeued), got %v", halt)
 	}
 }
 
