@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.1.3](https://github.com/chuntley/go-ralph-go/compare/v0.5.0...v0.1.3) (2026-06-29)
+
+
+### Features
+
+* branch guardrail + auth preflight for safer auto runs ([#18](https://github.com/chuntley/go-ralph-go/issues/18)) ([828685d](https://github.com/chuntley/go-ralph-go/commit/828685d4a0aef2be88fcf14c9bcc19a75d68f3cc))
+* goal-driven refine loop with min/max passes, verify gate, and auth reporting ([#12](https://github.com/chuntley/go-ralph-go/issues/12)) ([23ffab8](https://github.com/chuntley/go-ralph-go/commit/23ffab86b4ad50f880b5abc2834212430c0e84df))
+* open the PR deterministically and harden the cleanup pass ([#20](https://github.com/chuntley/go-ralph-go/issues/20)) ([02aa770](https://github.com/chuntley/go-ralph-go/commit/02aa770aff57227eb40c33b00e9850032b566518))
+* per-issue worktrees, parallel auto with live dashboard, and merge-repair ([#22](https://github.com/chuntley/go-ralph-go/issues/22)) ([4c46d74](https://github.com/chuntley/go-ralph-go/commit/4c46d744fe4de363eb720d2ac4aa2b1a9e3f7c0e))
+
+
+### Bug Fixes
+
+* halt `ralph auto` with an exit reason when an issue is marked failed ([#16](https://github.com/chuntley/go-ralph-go/issues/16)) ([3191cb2](https://github.com/chuntley/go-ralph-go/commit/3191cb2cca9b8bab85032996c4425cdeaeb7ce96))
+* never let the plan file record an overall "complete" status ([#14](https://github.com/chuntley/go-ralph-go/issues/14)) ([902c847](https://github.com/chuntley/go-ralph-go/commit/902c847618fb8b62bfacc7771e0ea009f378d8bd))
+* redact credentials and tighten session-log permissions ([#5](https://github.com/chuntley/go-ralph-go/issues/5)) ([1babe59](https://github.com/chuntley/go-ralph-go/commit/1babe59856b1c1664ad5263868aa09a702b62c27))
+* rotate Claude session per task and fix UTF-8 truncation ([5b5e8e4](https://github.com/chuntley/go-ralph-go/commit/5b5e8e467be167d289e462df21b11769f801730b))
+* rotate Claude session per task and fix UTF-8 truncation ([08aa70e](https://github.com/chuntley/go-ralph-go/commit/08aa70e3b426e13a0c98a2d9d27b8045886d0d33))
+
+
+### Miscellaneous Chores
+
+* bootstrap initial release ([0a59521](https://github.com/chuntley/go-ralph-go/commit/0a59521c2034bdd3eaaa5c829cd743d0c8609d21))
+* release 0.1.3 ([688fb44](https://github.com/chuntley/go-ralph-go/commit/688fb44d698a66ba68b30744b9443e0e6b688551))
+
 ## [0.5.0](https://github.com/chuntley/go-ralph-go/compare/v0.4.0...v0.5.0) (2026-06-29)
 
 
