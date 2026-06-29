@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"testing"
 	"time"
 
@@ -20,6 +19,7 @@ type fakeProvider struct {
 	failedReason string
 	requeued     int
 	resolved     int // issue number passed to MarkResolved, or 0 if never called
+	skipped      int // issue number passed to MarkSkipped, or 0 if never called
 
 	// Configurable return for FindPRForBranch — handleCleanupPR tests inject
 	// "PR exists" / "no PR" outcomes through these. Defaults (nil, nil) keep
@@ -32,6 +32,17 @@ type fakeProvider struct {
 	createPRTitle string
 	createPRBody  string
 	createPRError error
+
+	// Configurable merge-phase outcomes for the merge-repair tests. Defaults
+	// (nil) keep the historic happy-path tests untouched. waitErrSeq/mergeErrSeq,
+	// when set, are consumed one entry per call so a test can model "fails then
+	// succeeds"; a shorter sequence falls back to the scalar field / nil.
+	waitErr     error
+	mergeErr    error
+	waitErrSeq  []error
+	mergeErrSeq []error
+	waitCalls   int
+	mergeCalls  int
 }
 
 func (f *fakeProvider) Name() string                                   { return "fake" }
@@ -40,7 +51,9 @@ func (f *fakeProvider) EnsureLabels(context.Context, vcs.Labels) error { return 
 func (f *fakeProvider) NextReady(context.Context, vcs.Labels) (*vcs.Issue, error) {
 	return nil, vcs.ErrNoReadyIssue
 }
-func (f *fakeProvider) GetIssue(context.Context, int) (*vcs.Issue, error)  { return nil, nil }
+func (f *fakeProvider) GetIssue(_ context.Context, n int) (*vcs.Issue, error) {
+	return &vcs.Issue{Number: n, Title: fmt.Sprintf("issue %d", n)}, nil
+}
 func (f *fakeProvider) MarkWorking(context.Context, int, vcs.Labels) error { return nil }
 func (f *fakeProvider) MarkFailed(_ context.Context, n int, _ vcs.Labels, reason string) error {
 	f.failedReason = reason
@@ -54,6 +67,10 @@ func (f *fakeProvider) MarkResolved(_ context.Context, n int, _ vcs.Labels) erro
 	f.resolved = n
 	return nil
 }
+func (f *fakeProvider) MarkSkipped(_ context.Context, n int, _ vcs.Labels, _ string) error {
+	f.skipped = n
+	return nil
+}
 func (f *fakeProvider) FindPRForBranch(context.Context, string) (*vcs.PR, error) {
 	return f.findPRResult, f.findPRError
 }
@@ -63,8 +80,22 @@ func (f *fakeProvider) CreatePR(_ context.Context, head, base, title, body strin
 	f.createPRBody = body
 	return f.createdPR, f.createPRError
 }
-func (f *fakeProvider) WaitForChecks(context.Context, int, time.Duration) error { return nil }
-func (f *fakeProvider) SquashMergeAndDelete(context.Context, int) error         { return nil }
+func (f *fakeProvider) WaitForChecks(context.Context, int, time.Duration) error {
+	i := f.waitCalls
+	f.waitCalls++
+	if i < len(f.waitErrSeq) {
+		return f.waitErrSeq[i]
+	}
+	return f.waitErr
+}
+func (f *fakeProvider) SquashMergeAndDelete(context.Context, int) error {
+	i := f.mergeCalls
+	f.mergeCalls++
+	if i < len(f.mergeErrSeq) {
+		return f.mergeErrSeq[i]
+	}
+	return f.mergeErr
+}
 
 func TestCleanupDispatchInterruptedRequeues(t *testing.T) {
 	p := &fakeProvider{}
@@ -110,12 +141,17 @@ func TestCleanupDispatchNotLoggedInRequeues(t *testing.T) {
 	}
 }
 
-func TestAutoHaltReasonNoHaltOnNotLoggedIn(t *testing.T) {
-	// Mirrors dispatchCleanup: the issue was requeued, so this classifier does
-	// not produce a "labelled failed" halt. RunAuto halts the worker with the
-	// auth fix explicitly, before calling autoHaltReason.
-	if halt := autoHaltReason(1, "ralph-failed", fmt.Errorf("pass 1: %w", claude.ErrNotLoggedIn)); halt != nil {
-		t.Errorf("auth failure must not halt-as-failed (issue requeued), got %v", halt)
+func TestCleanupDispatchIssueGoneRequeues(t *testing.T) {
+	// A not-actionable issue (closed/merged/PR, e.g. re-dispatched after it
+	// shipped) must be requeued (working label cleared), NOT marked failed —
+	// otherwise the failed count is inflated with no GitHub evidence.
+	p := &fakeProvider{}
+	dispatchCleanup(p, 55, vcs.Labels{}, fmt.Errorf("%w: issue #55 is closed", errIssueGone))
+	if p.requeued != 55 {
+		t.Errorf("errIssueGone should requeue issue 55, got requeued=%d", p.requeued)
+	}
+	if p.failedReason != "" {
+		t.Errorf("errIssueGone must NOT mark the issue failed, got reason %q", p.failedReason)
 	}
 }
 
@@ -124,36 +160,5 @@ func TestCleanupDispatchNilNoop(t *testing.T) {
 	dispatchCleanup(p, 1, vcs.Labels{}, nil)
 	if p.requeued != 0 || p.failedReason != "" {
 		t.Errorf("nil error should be a noop, got requeued=%d failedReason=%q", p.requeued, p.failedReason)
-	}
-}
-
-func TestAutoHaltReasonHaltsOnFailure(t *testing.T) {
-	// A genuine failure (issue gets the ralph-failed label) must halt auto with
-	// an exit reason that names the issue, the label, and wraps the cause.
-	cause := errors.New("checks failed on PR #5")
-	halt := autoHaltReason(99, "ralph-failed", fmt.Errorf("merge: %w", cause))
-	if halt == nil {
-		t.Fatal("expected a halt reason on genuine failure")
-	}
-	if !errors.Is(halt, cause) {
-		t.Error("halt reason should wrap the underlying cause")
-	}
-	for _, want := range []string{"halting", "#99", "ralph-failed"} {
-		if !strings.Contains(halt.Error(), want) {
-			t.Errorf("halt reason %q missing %q", halt.Error(), want)
-		}
-	}
-}
-
-func TestAutoHaltReasonNoHaltOnSuccessOrCancel(t *testing.T) {
-	if halt := autoHaltReason(1, "ralph-failed", nil); halt != nil {
-		t.Errorf("success must not halt, got %v", halt)
-	}
-	// Cancellation / timeout means the issue was requeued, not failed — no halt.
-	if halt := autoHaltReason(1, "ralph-failed", fmt.Errorf("pass 3: %w", context.Canceled)); halt != nil {
-		t.Errorf("cancellation must not halt (issue requeued), got %v", halt)
-	}
-	if halt := autoHaltReason(1, "ralph-failed", context.DeadlineExceeded); halt != nil {
-		t.Errorf("deadline must not halt, got %v", halt)
 	}
 }

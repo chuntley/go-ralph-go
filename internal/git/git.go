@@ -54,6 +54,56 @@ func Push(ctx context.Context, dir, branch string) error {
 	return nil
 }
 
+// ForcePush pushes branch to origin with --force-with-lease, used after a
+// merge-repair pass that may have rebased the branch onto an updated default
+// branch (rewriting history) — a plain push would be rejected as non-fast-
+// forward. --force-with-lease (rather than --force) refuses to clobber remote
+// commits ralph hasn't seen, so a human pushing to the same branch isn't
+// silently overwritten.
+func ForcePush(ctx context.Context, dir, branch string) error {
+	if _, err := run(ctx, dir, "git", "push", "--force-with-lease", "-u", "origin", branch); err != nil {
+		return fmt.Errorf("force-push %s: %w", branch, err)
+	}
+	return nil
+}
+
+// Fetch updates remote-tracking refs for ref from remote WITHOUT touching any
+// working tree. ralph uses this in worktree mode to refresh the base branch
+// (e.g. origin/main) before cutting a per-issue worktree or rebasing one for a
+// merge repair — all without disturbing the user's root checkout.
+func Fetch(ctx context.Context, dir, remote, ref string) error {
+	if _, err := run(ctx, dir, "git", "fetch", remote, ref); err != nil {
+		return fmt.Errorf("fetch %s %s: %w", remote, ref, err)
+	}
+	return nil
+}
+
+// AddWorktree creates an isolated working tree at path for an issue, on branch
+// branch cut from base (typically "origin/<default>"). Like CreateWorkBranch it
+// uses -B so a re-run of the same issue resets the branch to up-to-date upstream
+// rather than failing on "already exists" or resuming stale commits. The repo at
+// repoDir is never checked out or modified — only the new worktree dir is — so a
+// user can keep working in the root checkout while ralph runs here in parallel.
+func AddWorktree(ctx context.Context, repoDir, path, branch, base string) error {
+	if _, err := run(ctx, repoDir, "git", "worktree", "add", "-B", branch, path, base); err != nil {
+		return fmt.Errorf("worktree add %s (%s off %s): %w", path, branch, base, err)
+	}
+	return nil
+}
+
+// RemoveWorktree tears down a worktree created by AddWorktree and prunes the
+// administrative record. Best-effort prune: a failure there is non-fatal. Uses
+// --force because the worktree may hold uncommitted scratch files (e.g. a
+// .ralph/ output dir) that a plain remove would refuse to discard; the branch
+// ref itself survives removal, so already-pushed work is never lost.
+func RemoveWorktree(ctx context.Context, repoDir, path string) error {
+	if _, err := run(ctx, repoDir, "git", "worktree", "remove", "--force", path); err != nil {
+		return fmt.Errorf("worktree remove %s: %w", path, err)
+	}
+	_, _ = run(ctx, repoDir, "git", "worktree", "prune")
+	return nil
+}
+
 // CommitsAhead returns how many commits branch is ahead of base (i.e. the
 // commits that would be merged), using local refs. Zero means the branch holds
 // no work to open a PR for.

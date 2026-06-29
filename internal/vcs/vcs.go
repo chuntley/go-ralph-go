@@ -73,6 +73,12 @@ type Provider interface {
 	// the working label forever (invisible to NextReady, unfindable).
 	MarkResolved(ctx context.Context, number int, l Labels) error
 
+	// MarkSkipped closes the issue with an explanatory note WITHOUT marking it
+	// failed. Used when ralph determined no changes were needed because the work
+	// already exists on the base branch (the loop produced no commits): that's a
+	// resolved/no-op outcome, not a failure that needs triage.
+	MarkSkipped(ctx context.Context, number int, l Labels, note string) error
+
 	// FindPRForBranch returns the open PR/MR for the given source branch, if any.
 	FindPRForBranch(ctx context.Context, branch string) (*PR, error)
 

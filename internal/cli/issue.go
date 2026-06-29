@@ -12,6 +12,7 @@ func newIssueCmd() *cobra.Command {
 	var minIterations int
 	var iterations int
 	var instructionsDoc string
+	var noWorktree bool
 
 	cmd := &cobra.Command{
 		Use:   "issue <number>",
@@ -29,6 +30,12 @@ func newIssueCmd() *cobra.Command {
 			if err := applyOverrides(cfg, minIterations, iterations, instructionsDoc); err != nil {
 				return err
 			}
+			if noWorktree {
+				cfg.Worktrees = false
+				if err := cfg.Validate(); err != nil {
+					return fmt.Errorf("invalid --no-worktree: %w", err)
+				}
+			}
 			return runner.RunIssue(cmd.Context(), cfg, n)
 		},
 	}
@@ -36,5 +43,6 @@ func newIssueCmd() *cobra.Command {
 	cmd.Flags().IntVar(&minIterations, "min-iterations", 0, "override the minimum refine passes before completion is honoured")
 	cmd.Flags().IntVarP(&iterations, "iterations", "n", 0, "override the max refine passes safety cap")
 	cmd.Flags().StringVar(&instructionsDoc, "instructions-doc", "", "override the doc Claude follows during cleanup")
+	cmd.Flags().BoolVar(&noWorktree, "no-worktree", false, "disable worktree isolation; work in-place in the repo root (requires a clean tree)")
 	return cmd
 }

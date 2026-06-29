@@ -14,6 +14,8 @@ func newAutoCmd() *cobra.Command {
 	var iterations int
 	var instructionsDoc string
 	var pollSeconds int
+	var noWorktree bool
+	var parallel int
 
 	cmd := &cobra.Command{
 		Use:   "auto",
@@ -28,9 +30,18 @@ func newAutoCmd() *cobra.Command {
 			}
 			if pollSeconds > 0 {
 				cfg.PollInterval = pollSeconds
-				if err := cfg.Validate(); err != nil {
-					return fmt.Errorf("invalid --poll: %w", err)
-				}
+			}
+			if noWorktree && parallel > 1 {
+				return fmt.Errorf("--no-worktree can't be combined with --parallel %d: parallelism needs a worktree per issue", parallel)
+			}
+			if noWorktree {
+				cfg.Worktrees = false
+			}
+			if parallel > 0 {
+				cfg.MaxParallel = parallel
+			}
+			if err := cfg.Validate(); err != nil {
+				return fmt.Errorf("invalid flags: %w", err)
 			}
 			return runner.RunAuto(cmd.Context(), cfg, once)
 		},
@@ -41,5 +52,7 @@ func newAutoCmd() *cobra.Command {
 	cmd.Flags().IntVarP(&iterations, "iterations", "n", 0, "override the max refine passes safety cap")
 	cmd.Flags().StringVar(&instructionsDoc, "instructions-doc", "", "override the doc Claude follows during cleanup")
 	cmd.Flags().IntVar(&pollSeconds, "poll", 0, "override poll interval in seconds (min 30; default from config / 60)")
+	cmd.Flags().BoolVar(&noWorktree, "no-worktree", false, "disable per-issue worktree isolation; work in-place in the repo root (requires a clean tree)")
+	cmd.Flags().IntVar(&parallel, "parallel", 0, "work up to N issues concurrently, each in its own worktree")
 	return cmd
 }
