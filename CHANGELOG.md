@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/chuntley/go-ralph-go/compare/v0.4.0...v0.5.0) (2026-06-29)
+
+
+### Features
+
+* per-issue worktrees, parallel auto with live dashboard, and merge-repair ([#22](https://github.com/chuntley/go-ralph-go/pull/22))
+
 ## [0.4.0](https://github.com/chuntley/go-ralph-go/compare/v0.3.0...v0.4.0) (2026-06-17)
 
 
