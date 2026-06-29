@@ -291,3 +291,83 @@ func TestOriginURLErrorsWhenMissing(t *testing.T) {
 		t.Error("expected error when no origin remote is configured")
 	}
 }
+
+// TestWorktreeRoundTrip exercises Fetch + AddWorktree + RemoveWorktree against a
+// repo wired to a bare origin: a worktree is cut from origin/main into its own
+// directory on a new branch, then removed — and the branch ref survives removal
+// so already-committed work is never lost.
+func TestWorktreeRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	bare := t.TempDir()
+	mustGit(t, bare, "init", "--bare", "-b", "main")
+
+	work := initRepo(t, "main")
+	mustGit(t, work, "remote", "add", "origin", bare)
+	mustGit(t, work, "push", "-u", "origin", "main")
+
+	if err := Fetch(ctx, work, "origin", "main"); err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+
+	wtBase := t.TempDir()
+	wtPath := filepath.Join(wtBase, "issue-7")
+	if err := AddWorktree(ctx, work, wtPath, "ralph/issue-7-x", "origin/main"); err != nil {
+		t.Fatalf("AddWorktree: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(wtPath, "README.md")); err != nil {
+		t.Fatalf("worktree should be a real checkout: %v", err)
+	}
+	br, err := CurrentBranch(ctx, wtPath)
+	if err != nil || br != "ralph/issue-7-x" {
+		t.Fatalf("worktree branch = %q, %v; want ralph/issue-7-x", br, err)
+	}
+
+	// Commit in the worktree so the branch has work, then remove the worktree.
+	if err := os.WriteFile(filepath.Join(wtPath, "f.txt"), []byte("hi\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, wtPath, "add", ".")
+	mustGit(t, wtPath, "commit", "-m", "work")
+
+	if err := RemoveWorktree(ctx, work, wtPath); err != nil {
+		t.Fatalf("RemoveWorktree: %v", err)
+	}
+	if _, err := os.Stat(wtPath); !os.IsNotExist(err) {
+		t.Errorf("worktree dir should be gone after RemoveWorktree (err=%v)", err)
+	}
+	// The branch ref must still exist (commits aren't lost with the worktree).
+	if _, err := CurrentBranch(ctx, work); err != nil {
+		t.Fatalf("root repo still usable: %v", err)
+	}
+	if out, err := run(ctx, work, "git", "rev-parse", "--verify", "ralph/issue-7-x"); err != nil {
+		t.Errorf("branch ref should survive worktree removal: %v\n%s", err, out)
+	}
+}
+
+// TestForcePushAfterRebase confirms ForcePush succeeds where a plain push would
+// be rejected: the local branch is rebased (history rewritten) after being
+// pushed, exactly the merge-repair situation.
+func TestForcePushAfterRebase(t *testing.T) {
+	ctx := context.Background()
+	bare := t.TempDir()
+	mustGit(t, bare, "init", "--bare", "-b", "main")
+
+	work := initRepo(t, "main")
+	mustGit(t, work, "remote", "add", "origin", bare)
+	mustGit(t, work, "push", "-u", "origin", "main")
+
+	mustGit(t, work, "checkout", "-b", "feature")
+	if err := os.WriteFile(filepath.Join(work, "a.txt"), []byte("a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, work, "add", ".")
+	mustGit(t, work, "commit", "-m", "a")
+	if err := Push(ctx, work, "feature"); err != nil {
+		t.Fatalf("initial Push: %v", err)
+	}
+	// Rewrite history: amend the commit so the remote ref is no longer an ancestor.
+	mustGit(t, work, "commit", "--amend", "-m", "a (amended)")
+	if err := ForcePush(ctx, work, "feature"); err != nil {
+		t.Fatalf("ForcePush after rewrite should succeed: %v", err)
+	}
+}

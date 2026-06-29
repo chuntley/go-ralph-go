@@ -68,6 +68,19 @@ func (p *Provider) MarkResolved(ctx context.Context, number int, l vcs.Labels) e
 	return err
 }
 
+func (p *Provider) MarkSkipped(ctx context.Context, number int, l vcs.Labels, note string) error {
+	remove := gl.LabelOptions{l.Ready, l.Working}
+	closeEvent := "close"
+	if _, _, err := p.client.Issues.UpdateIssue(p.project, int64(number), &gl.UpdateIssueOptions{
+		RemoveLabels: &remove,
+		StateEvent:   &closeEvent,
+	}, gl.WithContext(ctx)); err != nil {
+		return err
+	}
+	_, _, err := p.client.Notes.CreateIssueNote(p.project, int64(number), &gl.CreateIssueNoteOptions{Body: &note}, gl.WithContext(ctx))
+	return err
+}
+
 var labelColors = map[string]string{
 	"ready":   "#0e8a16",
 	"working": "#fbca04",

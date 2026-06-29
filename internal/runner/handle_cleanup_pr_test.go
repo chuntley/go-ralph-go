@@ -108,20 +108,24 @@ func TestHandleCleanupPRErrorsIfStuckOnDefaultBranch(t *testing.T) {
 	}
 }
 
-// TestHandleCleanupPRErrorsWhenBranchHasNoCommits — on a feature branch with no
-// commits over the base and no PR, there is genuinely nothing to open a PR for.
-// ensurePR must say so (and must NOT attempt a push — there's no origin here).
-func TestHandleCleanupPRErrorsWhenBranchHasNoCommits(t *testing.T) {
+// TestHandleCleanupPRSkipsWhenBranchHasNoCommits — on a feature branch with no
+// commits over the base and no PR, the work already exists on the base: that's
+// a resolved no-op, not a failure. ralph must close the issue via MarkSkipped
+// (not MarkFailed), open no PR, and return nil so the issue isn't burned into
+// the failed pile or halting the run.
+func TestHandleCleanupPRSkipsWhenBranchHasNoCommits(t *testing.T) {
 	dir := initRepoOnBranch(t, "main", "feature/empty") // branched, no extra commit
 	prov := &fakeProvider{findPRResult: nil}
 	r := newRunForTest(t, dir, "main", prov)
 
-	err := r.handleCleanupPR(context.Background(), 42, "Fix the thing")
-	if err == nil {
-		t.Fatal("expected error when the branch carries no work")
+	if err := r.handleCleanupPR(context.Background(), 42, "Fix the thing"); err != nil {
+		t.Fatalf("no-commits should be a skip (nil), got error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "no commits over") {
-		t.Errorf("error should explain there's nothing to PR; got: %v", err)
+	if prov.skipped != 42 {
+		t.Errorf("issue should be closed via MarkSkipped (skipped=%d)", prov.skipped)
+	}
+	if prov.failedReason != "" {
+		t.Errorf("must NOT mark a no-op issue failed; got reason %q", prov.failedReason)
 	}
 	if prov.createdPR != nil {
 		t.Error("must not open a PR for an empty branch")

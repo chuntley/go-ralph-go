@@ -3,7 +3,6 @@ package runner
 import (
 	"context"
 	"errors"
-	"fmt"
 	"regexp"
 	"time"
 
@@ -34,38 +33,15 @@ func dispatchCleanup(p vcs.Provider, issueNum int, labels vcs.Labels, resultErr 
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
 	defer cancel()
-	if errors.Is(resultErr, context.Canceled) || errors.Is(resultErr, context.DeadlineExceeded) || errors.Is(resultErr, claude.ErrNotLoggedIn) {
+	if errors.Is(resultErr, context.Canceled) || errors.Is(resultErr, context.DeadlineExceeded) || errors.Is(resultErr, claude.ErrNotLoggedIn) || errors.Is(resultErr, errIssueGone) {
+		// Interrupt / timeout / auth problem / not-actionable issue: clear the
+		// working label and return the issue to the queue rather than marking it
+		// failed. (For a closed issue the requeue is a harmless no-op — it stays
+		// closed; it just sheds the stray ralph-working label.)
 		_ = p.MarkRequeued(ctx, issueNum, labels)
 		return
 	}
 	_ = p.MarkFailed(ctx, issueNum, labels, truncate(redactSecrets(resultErr.Error()), maxReasonLen))
-}
-
-// autoHaltReason decides whether an auto-loop iteration should halt the whole
-// worker. It mirrors dispatchCleanup's classification so the two stay in sync:
-//
-//	processErr == nil                     → no halt (success).
-//	ctx.Canceled / DeadlineExceeded       → no halt: the issue was requeued
-//	                                         (Ctrl+C / timeout), handled by the
-//	                                         normal cancellation path.
-//	claude not-logged-in                  → no halt here: the issue was requeued
-//	                                         (mirrors dispatchCleanup); RunAuto
-//	                                         halts the worker with the auth fix
-//	                                         explicitly, before calling this.
-//	anything else                         → halt: the issue was just labelled
-//	                                         failed, so return an exit reason.
-//
-// Returning an error (rather than logging and continuing) is what makes
-// `ralph auto` stop the moment an issue is marked failed instead of moving on
-// to the next one.
-func autoHaltReason(issueNum int, failedLabel string, processErr error) error {
-	if processErr == nil {
-		return nil
-	}
-	if errors.Is(processErr, context.Canceled) || errors.Is(processErr, context.DeadlineExceeded) || errors.Is(processErr, claude.ErrNotLoggedIn) {
-		return nil
-	}
-	return fmt.Errorf("auto mode halting: issue #%d was labelled %q after failing — review it before resuming auto: %w", issueNum, failedLabel, processErr)
 }
 
 // secretPatterns matches credentials we may inadvertently include in error

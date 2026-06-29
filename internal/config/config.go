@@ -123,6 +123,40 @@ type Config struct {
 	// Validate() enforces a minimum of 30 to stay within host rate limits.
 	PollInterval int `toml:"poll_interval"`
 
+	// Worktrees controls per-issue git worktree isolation (default: true). When
+	// on, each issue is worked in its own `git worktree` (a separate checkout
+	// cut from up-to-date upstream) instead of in-place in the repo root. The
+	// root checkout is never touched — so a developer can keep working in it
+	// (even with a dirty tree) while ralph works issues in parallel worktrees.
+	// This is the prerequisite for MaxParallel > 1. Set to false to restore the
+	// original in-place behaviour (work the branch directly in the repo root).
+	Worktrees bool `toml:"worktrees"`
+
+	// WorktreeDir is the base directory under which per-issue worktrees are
+	// created (one subdir per issue). Empty (default) means a per-repo dir under
+	// the OS temp dir. Kept OUTSIDE the repo so worktrees never need a
+	// .gitignore entry and the agent never sees a nested checkout. Only used
+	// when Worktrees is true.
+	WorktreeDir string `toml:"worktree_dir"`
+
+	// MaxParallel is how many issues auto mode may work concurrently, each in
+	// its own worktree. Default: 3. Parallelism requires Worktrees (concurrent
+	// issues cannot share one checkout), so Validate clamps MaxParallel to 1
+	// whenever Worktrees is off. When MaxParallel > 1, auto mode renders a
+	// compact live status dashboard instead of streaming one issue's raw output.
+	// Set to 1 for sequential mode with full streaming output.
+	MaxParallel int `toml:"max_parallel"`
+
+	// MergeRepairAttempts caps how many times ralph will, after a PR fails its
+	// checks or refuses to merge (broken tests, merge conflicts), feed the
+	// failure back to Claude as a repair pass — rebasing onto the updated
+	// default branch, fixing the failure, re-pushing — before retrying the
+	// merge. This is what lets `ralph auto` keep working an issue until it
+	// actually merges rather than giving up on the first red check. Default: 3.
+	// 0 disables repair (fail on the first check/merge failure, pre-repair
+	// behaviour).
+	MergeRepairAttempts int `toml:"merge_repair_attempts"`
+
 	// GitHub holds GitHub-specific overrides.
 	GitHub GitHubConfig `toml:"github"`
 }
@@ -192,12 +226,15 @@ COMMIT: Commit the finished work with a clear message, and update {{plan_file}} 
 SCOPE: Do not add features, abstractions, or defensive code beyond the goal, and do not refactor code unrelated to what you are fixing.
 
 COMPLETION: A passing VERIFY command is necessary but NOT sufficient — green tests do not prove correctness (they can assert the wrong values, test the implementation instead of the requirement, or omit cases entirely). Before signaling completion, do a final skeptical review of the ENTIRE change against the base branch (e.g. ` + "`git diff`" + `) as a reviewer who did NOT write it, and confirm ALL of: (1) you independently re-derived each acceptance criterion from the goal and the tests genuinely assert it; (2) the tests cover the real behavior plus its edge and failure cases; (3) no rework would make the solution meaningfully more correct or robust; (4) the VERIFY command passes with its real output shown above. Only if all four hold and you genuinely cannot find anything to improve, output the line {{sentinel}} alone on its own line with nothing after it. If anything is uncertain or improvable — however minor — do NOT output {{sentinel}}: fix it now, or if it is genuinely out of reach, record it under FINDINGS.`,
-		CleanupPrompt: "The Ralph loop just exited{{issue_clause}}. This is a single, non-interactive cleanup turn: there is no later turn, and any process you start in the background is killed the moment this turn ends. Do everything now, in the foreground, and finish before you end this response. Per {{instructions_doc}}, commit anything still outstanding, push the branch, and open a PR. Do NOT run verification (tests, builds, lint) or any other work in the background, and do NOT defer the push until after something else finishes — if you want to run checks first, run them synchronously now, then push and open the PR in this same response.{{closes_clause}}",
-		IssuePrompt:   "Work on {{provider}} issue #{{number}}. Read the title and body carefully; if your host CLI is available (`gh` or `glab`), also read the issue comments — they may contain crucial follow-up context.\n\nTitle: {{title}}\n\nBody:\n{{body}}",
-		OutputDir:     ".ralph",
-		ClaudeBin:     "claude",
-		BranchPrefix:  "ralph",
-		PollInterval:  60,
+		CleanupPrompt:       "The Ralph loop just exited{{issue_clause}}. This is a single, non-interactive cleanup turn: there is no later turn, and any process you start in the background is killed the moment this turn ends. Do everything now, in the foreground, and finish before you end this response. Per {{instructions_doc}}, commit anything still outstanding, push the branch, and open a PR. Do NOT run verification (tests, builds, lint) or any other work in the background, and do NOT defer the push until after something else finishes — if you want to run checks first, run them synchronously now, then push and open the PR in this same response.{{closes_clause}}",
+		IssuePrompt:         "Work on {{provider}} issue #{{number}}. Read the title and body carefully; if your host CLI is available (`gh` or `glab`), also read the issue comments — they may contain crucial follow-up context.\n\nTitle: {{title}}\n\nBody:\n{{body}}",
+		OutputDir:           ".ralph",
+		ClaudeBin:           "claude",
+		BranchPrefix:        "ralph",
+		PollInterval:        60,
+		Worktrees:           true,
+		MaxParallel:         3,
+		MergeRepairAttempts: 3,
 		GitHub: GitHubConfig{
 			Labels: LabelConfig{
 				Ready:   "ready",
@@ -230,6 +267,19 @@ func (c *Config) Validate() error {
 	}
 	if c.PollInterval < 30 {
 		return fmt.Errorf("poll_interval must be >= 30 seconds (got %d) — host rate limits", c.PollInterval)
+	}
+	if c.MaxParallel < 1 {
+		return fmt.Errorf("max_parallel must be >= 1 (got %d)", c.MaxParallel)
+	}
+	// Worktrees is the master switch for parallelism: concurrent issues each need
+	// their own checkout, so without worktrees we can only run one at a time.
+	// Clamp rather than error so disabling worktrees (or --no-worktree) silently
+	// falls back to sequential instead of forcing the user to also zero this out.
+	if !c.Worktrees && c.MaxParallel > 1 {
+		c.MaxParallel = 1
+	}
+	if c.MergeRepairAttempts < 0 {
+		return fmt.Errorf("merge_repair_attempts must be >= 0 (got %d)", c.MergeRepairAttempts)
 	}
 	return nil
 }
@@ -404,6 +454,26 @@ const starterTOML = `# go-ralph-go project config — defaults shown, uncomment 
 # claude_bin       = "claude"
 # poll_interval    = 60           # auto-mode poll seconds (min 30)
 # default_branch   = ""           # override auto-detected default branch
+
+# worktrees        = true         # DEFAULT. Work each issue in its OWN git
+#                                 # worktree (an isolated checkout cut from
+#                                 # up-to-date upstream). The repo root is never
+#                                 # touched — keep working in it (even dirty)
+#                                 # while ralph runs. Set false for the original
+#                                 # in-place behaviour (works the branch in the
+#                                 # repo root; requires a clean tree).
+# worktree_dir     = ""           # base dir for per-issue worktrees; empty =
+#                                 # a per-repo dir under the OS temp dir. Kept
+#                                 # OUTSIDE the repo. Only used when worktrees=true.
+# max_parallel     = 3            # how many issues "ralph auto" works at once,
+#                                 # each in its own worktree (DEFAULT 3). >1 shows
+#                                 # a compact live status dashboard; set 1 for
+#                                 # sequential mode with full streaming output.
+#                                 # Clamped to 1 automatically when worktrees=false.
+# merge_repair_attempts = 3       # after a PR fails checks or refuses to merge
+#                                 # (broken tests / conflicts), how many times to
+#                                 # feed the failure back to Claude (rebase, fix,
+#                                 # re-push) before retrying the merge. 0 disables.
 # branch_prefix    = "ralph"      # namespace for the per-task branch ralph
 #                                 # creates before the loop in PR-opening modes
 #                                 # (issue/auto/run --pr): "ralph/issue-<N>-<slug>".

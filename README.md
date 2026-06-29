@@ -41,22 +41,26 @@ go build -o ~/bin/ralph ./cmd/ralph
 
 For each task ralph receives, it:
 
-1. **Branches** — syncs the default branch, then creates and checks out a dedicated working branch (`ralph/issue-<N>-<slug>`, configurable via `branch_prefix`) *before* any work. This is a guardrail, not a suggestion: because the loop starts on a feature branch, every commit Claude makes — and any push — lands there, never on the protected default branch, regardless of what your instructions doc says.
+1. **Isolates in a worktree** — by default each issue is worked in its **own `git worktree`** (a separate checkout cut from up-to-date upstream), on a dedicated branch (`ralph/issue-<N>-<slug>`, configurable via `branch_prefix`). The repo root is **never touched** — so you can keep working in it (even with a dirty tree) while ralph runs, and ralph can work several issues at once without them colliding. The branch is a hard guardrail: every commit Claude makes — and any push — lands there, never on the protected default branch. (Set `worktrees = false` / `--no-worktree` to work in-place in the repo root the old way, which requires a clean tree.)
 2. **Refines toward the goal** — treats the work prompt as a *goal* and loops Claude over it, keeping durable state in a plan file on disk. It always runs at least `min_iterations` passes (default 5) — early "done" signals are ignored so the work gets real re-audits — then ends as soon as Claude signals the goal is complete (confirmed by your `verify_command` when set), up to a max-passes cap (`iterations`, default 10). Claude is never told either bound.
 3. **Cleans up** — runs a final pass telling Claude to push the branch and open a PR (matching your project's `AGENTS.md` / `CLAUDE.md` style guide). This pass is a single non-interactive turn, so the prompt tells Claude to finish synchronously and not background work or defer the push. If it commits work but still doesn't open the PR, **ralph pushes the branch and opens the PR itself** — so a run never fails just because the agent ran out of turn.
 4. **Validates** — waits for CI checks via the host API.
-5. **Merges** — squash-merges, deletes the source branch, and closes the issue.
-6. **Resets** — checks out the default branch and fast-forwards, leaving your repo clean for the next loop.
+5. **Repairs until mergeable** — if the checks go red or the merge is refused (broken tests, merge conflicts), ralph doesn't give up: it feeds the exact failure back to Claude as a focused repair pass — **rebase onto the updated default branch, fix the cause, re-push** — and retries the merge, up to `merge_repair_attempts` times (default 3). This matters most under parallelism, where conflicts and base-moved-under-you are common.
+6. **Merges** — squash-merges, deletes the source branch, and closes the issue.
+7. **Resets** — removes the worktree (in-place mode: checks out the default branch and fast-forwards), leaving everything clean for the next loop.
 
 It does this in three modes:
 
-| Command                     | When to use                                    | Needs git host? |
-| --------------------------- | ---------------------------------------------- | --------------- |
-| `ralph run "<prompt>"`      | Ad-hoc local work; refine loop + commit        | No              |
-| `ralph run --pr "<prompt>"` | Ad-hoc work, open a PR, no auto-merge          | Yes             |
-| `ralph issue <N>`           | Single issue end-to-end (PR + merge)           | Yes             |
-| `ralph auto`                | Poll for `ready`-labelled issues and ship them | Yes             |
-| `ralph auto --once`         | Same, but exit after one cycle                 | Yes             |
+| Command                       | When to use                                              | Needs git host? |
+| ----------------------------- | -------------------------------------------------------- | --------------- |
+| `ralph run "<prompt>"`        | Ad-hoc local work; refine loop + commit                  | No              |
+| `ralph run --pr "<prompt>"`   | Ad-hoc work, open a PR, no auto-merge                    | Yes             |
+| `ralph issue <N>`             | Single issue end-to-end (PR + merge)                     | Yes             |
+| `ralph auto`                  | Poll for `ready`-labelled issues and ship them           | Yes             |
+| `ralph auto --parallel <N>`   | Same, but work up to N issues at once, each in a worktree | Yes            |
+| `ralph auto --once`           | Same, but exit after one cycle                           | Yes             |
+
+**Peak parallelism:** because worktrees are on by default and never touch the repo root, you can run your own Claude session against the main checkout while `ralph auto --parallel 3` ships three other issues in their own worktrees simultaneously. Parallel mode shows a compact live status dashboard (one row per in-flight issue: status, elapsed, latest message) instead of interleaving raw output; each issue's full transcript still lands in its worktree's `.ralph/output.txt`. On a non-TTY (CI, a pipe) it degrades to plain prefixed lines.
 
 Supports **GitHub** (including GitHub Enterprise) and **GitLab** (cloud and self-hosted). The provider is auto-detected from the `origin` remote.
 
@@ -101,6 +105,18 @@ output_dir       = ".ralph"     # run logs + plan.md go here (gitignored)
 claude_bin       = "claude"     # override if your binary is elsewhere
 poll_interval    = 60           # auto-mode poll seconds (min 30)
 default_branch   = ""           # override auto-detected default branch
+
+worktrees        = true         # work each issue in its own git worktree
+                                # (DEFAULT); repo root is never touched. false
+                                # = in-place in the root (needs a clean tree)
+worktree_dir     = ""           # base dir for worktrees; "" = under $TMPDIR
+max_parallel     = 3            # issues `ralph auto` works at once, each in its
+                                # own worktree (DEFAULT 3); >1 shows the live
+                                # status dashboard. Set 1 for sequential +
+                                # streaming. Auto-clamped to 1 if worktrees off
+merge_repair_attempts = 3       # times to feed a failed check / refused merge
+                                # back to Claude (rebase, fix, re-push) before
+                                # giving up; 0 disables
 
 completion_sentinel = "RALPH_GOAL_COMPLETE"  # line Claude emits when goal is done
 
@@ -205,7 +221,7 @@ ralph auto --once                         # one cycle then exit
 
 Ralph creates these labels on first run (`EnsureLabels`). Rename them in the `[github.labels]` (or `[gitlab.labels]`) section if your project uses different conventions — colors and descriptions are preserved across renames.
 
-**`ralph auto` halts when an issue is marked `ralph-failed`.** Rather than quietly moving on to the next issue, the worker exits non-zero with a reason naming the failed issue, so a broken run surfaces to a human for triage instead of compounding. (A `Ctrl+C` / timeout is different: that *requeues* the in-flight issue as `ready` and exits cleanly — it is not a failure.)
+**`ralph auto` keeps working the queue.** When an issue genuinely fails it is labelled `ralph-failed` (with an explanatory comment) and the worker **moves on to the next issue** rather than halting — failures accumulate in the `ralph-failed` pile for you to triage while the rest of the queue still ships. The live summary reports the running done/failed counts. (Two cases are *not* failures: a `Ctrl+C` / timeout *requeues* the in-flight issue as `ready` and exits cleanly; and an issue whose work **already exists on the default branch** — the loop produced no commits — is **closed as resolved** with a note, not marked failed. A lapsed Claude login is the one thing that still halts the whole run, since every subsequent issue would fail identically — see below.)
 
 ---
 
@@ -305,7 +321,7 @@ On Ctrl+C, ralph sends Claude a polite `SIGINT` with a 10s grace period, then es
 6. **No surprise pushes in local mode.** `ralph run` without `--pr` tells Claude explicitly _not_ to push or open a PR.
 7. **No commits to the protected default branch.** In PR-opening modes (issue / auto / `run --pr`) ralph creates and checks out a dedicated working branch *before* the loop, so a project whose instructions say "push each session" can't publish straight to `main`/`master`. The work prompt also tells Claude it's on that branch and must not commit to the default branch, and the cleanup step still backstops by refusing to proceed if the run somehow ended on the default branch.
 8. **No lost work when the agent doesn't open the PR.** ralph owns the PR mechanics: if the cleanup pass committed work but didn't open a PR (e.g. it backgrounded a long test gate and ran out of turn), ralph pushes the branch and opens the PR itself. It only errors when there's genuinely nothing to ship (no commits over the base).
-9. **No silent failure in `auto`.** The moment an issue is marked `ralph-failed`, `ralph auto` exits non-zero with a reason instead of moving on — a broken run gets human triage rather than compounding across the queue. (Interrupts requeue the issue and exit cleanly; they are not failures.)
+9. **Resilient `auto`.** A failed issue is labelled `ralph-failed` (with a comment) and `ralph auto` keeps working the rest of the queue rather than halting on it; an issue whose work already exists on the default branch is closed as resolved (not failed). Interrupts requeue the in-flight issue and exit cleanly. Only a lapsed Claude login halts the whole run (every subsequent issue would fail identically).
 10. **No usable-login surprises.** Every run preflights `claude auth status` for the active config dir and stops up front with the exact `claude auth login` command if it isn't logged in; an auth failure mid-run requeues the issue (never marks it failed) and halts with the fix.
 
 ---

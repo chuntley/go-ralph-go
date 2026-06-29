@@ -50,6 +50,58 @@ func TestValidateClampsMinToMax(t *testing.T) {
 	}
 }
 
+func TestValidateParallelism(t *testing.T) {
+	// Default: worktrees on, max_parallel 1 — valid.
+	def := Defaults()
+	if err := def.Validate(); err != nil {
+		t.Fatalf("defaults should validate: %v", err)
+	}
+
+	// max_parallel > 1 with worktrees on — valid.
+	c := Defaults()
+	c.MaxParallel = 4
+	if err := c.Validate(); err != nil {
+		t.Errorf("parallel with worktrees should validate: %v", err)
+	}
+
+	// max_parallel > 1 without worktrees — clamped to 1 (can't share a checkout),
+	// not an error: disabling worktrees should just fall back to sequential.
+	c = Defaults()
+	c.MaxParallel = 4
+	c.Worktrees = false
+	if err := c.Validate(); err != nil {
+		t.Errorf("worktrees=false should clamp, not error: %v", err)
+	}
+	if c.MaxParallel != 1 {
+		t.Errorf("max_parallel should clamp to 1 when worktrees off, got %d", c.MaxParallel)
+	}
+
+	// max_parallel < 1 — rejected.
+	c = Defaults()
+	c.MaxParallel = 0
+	if err := c.Validate(); err == nil {
+		t.Error("expected error when max_parallel < 1")
+	}
+
+	// merge_repair_attempts negative — rejected; 0 allowed (disables repair).
+	c = Defaults()
+	c.MergeRepairAttempts = -1
+	if err := c.Validate(); err == nil {
+		t.Error("expected error when merge_repair_attempts < 0")
+	}
+	c = Defaults()
+	c.MergeRepairAttempts = 0
+	if err := c.Validate(); err != nil {
+		t.Errorf("merge_repair_attempts = 0 should be valid (disables repair): %v", err)
+	}
+}
+
+func TestWorktreesDefaultsOn(t *testing.T) {
+	if !Defaults().Worktrees {
+		t.Error("worktrees should default to true")
+	}
+}
+
 func TestEnsureGitignoreCreatesFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, ".gitignore")
@@ -147,6 +199,15 @@ func TestDefaultsMatchDocumentation(t *testing.T) {
 	}
 	if c.PollInterval != 60 {
 		t.Errorf("PollInterval default: got %d, want 60", c.PollInterval)
+	}
+	if !c.Worktrees {
+		t.Errorf("Worktrees default: got %v, want true", c.Worktrees)
+	}
+	if c.MaxParallel != 3 {
+		t.Errorf("MaxParallel default: got %d, want 3", c.MaxParallel)
+	}
+	if c.MergeRepairAttempts != 3 {
+		t.Errorf("MergeRepairAttempts default: got %d, want 3", c.MergeRepairAttempts)
 	}
 	if c.GitHub.CheckIntervalSeconds != 30 {
 		t.Errorf("GitHub.CheckIntervalSeconds default: got %d, want 30", c.GitHub.CheckIntervalSeconds)

@@ -66,6 +66,17 @@ func (p *Provider) MarkResolved(ctx context.Context, number int, l vcs.Labels) e
 	return err
 }
 
+func (p *Provider) MarkSkipped(ctx context.Context, number int, l vcs.Labels, note string) error {
+	_ = p.removeLabel(ctx, number, l.Working)
+	_ = p.removeLabel(ctx, number, l.Ready)
+	if _, _, err := p.client.Issues.CreateComment(ctx, p.owner, p.repo, number, &gh.IssueComment{Body: &note}); err != nil {
+		return err
+	}
+	state := "closed"
+	_, _, err := p.client.Issues.Edit(ctx, p.owner, p.repo, number, &gh.IssueRequest{State: &state})
+	return err
+}
+
 // labelDef carries the canonical color/description for a label slot.
 type labelDef struct {
 	color string

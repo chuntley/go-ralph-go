@@ -47,6 +47,14 @@ func runDoctor(ctx context.Context, out io.Writer) error {
 	fmt.Fprintf(out, "  [OK]   project root : %s\n", cfg.ProjectRoot)
 	fmt.Fprintf(out, "         config       : %s\n", src)
 	fmt.Fprintf(out, "         passes       : min %d, max %d\n", cfg.MinIterations, cfg.Iterations)
+	isolation := "in-place (works the branch in the repo root)"
+	if cfg.Worktrees {
+		isolation = "git worktree per issue (repo root untouched)"
+		if cfg.MaxParallel > 1 {
+			isolation = fmt.Sprintf("git worktree per issue, up to %d in parallel", cfg.MaxParallel)
+		}
+	}
+	fmt.Fprintf(out, "         isolation    : %s\n", isolation)
 	if cfg.VerifyCommand != "" {
 		fmt.Fprintf(out, "         verify cmd   : %s\n", cfg.VerifyCommand)
 	} else {
@@ -114,10 +122,13 @@ func runDoctor(ctx context.Context, out io.Writer) error {
 	fmt.Fprintln(out, "  [OK]   git          : repo detected")
 
 	clean, _ := git.IsClean(ctx, cfg.ProjectRoot)
-	if clean {
+	switch {
+	case clean:
 		fmt.Fprintln(out, "  [OK]   working tree : clean")
-	} else {
-		fmt.Fprintln(out, "  [WARN] working tree : has uncommitted changes (commit or stash before issue/auto modes)")
+	case cfg.Worktrees:
+		fmt.Fprintln(out, "  [OK]   working tree : has uncommitted changes — fine; worktree mode never touches the repo root")
+	default:
+		fmt.Fprintln(out, "  [WARN] working tree : has uncommitted changes (commit or stash before in-place issue/auto, or keep worktrees enabled)")
 	}
 
 	branch, _ := git.DefaultBranch(ctx, cfg.ProjectRoot)

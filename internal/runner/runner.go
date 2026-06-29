@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -38,6 +39,11 @@ func RunPrompt(ctx context.Context, cfg *config.Config, prompt string, openPR bo
 		}
 	}
 
+	// Ad-hoc run/run --pr always works in-place in the repo root (no per-issue
+	// worktree): the user is driving an interactive prompt against their current
+	// checkout, on their chosen base.
+	ws := r.rootWorkspace()
+
 	workPrompt := prompt
 	var cleanupPrompt string
 	if openPR {
@@ -56,7 +62,7 @@ func RunPrompt(ctx context.Context, cfg *config.Config, prompt string, openPR bo
 		cleanupPrompt = "The Ralph loop just exited. Stage and commit any outstanding changes with a clear, descriptive message. Do not push or open a PR."
 	}
 
-	if err := r.cycle(ctx, workPrompt, cleanupPrompt); err != nil {
+	if err := r.cycle(ctx, ws, workPrompt, cleanupPrompt); err != nil {
 		if errors.Is(err, claude.ErrNotLoggedIn) {
 			return r.authFailureError(err)
 		}
@@ -66,7 +72,7 @@ func RunPrompt(ctx context.Context, cfg *config.Config, prompt string, openPR bo
 		r.log("Prompt mode complete; not opening a PR.")
 		return nil
 	}
-	return r.handleCleanupPR(ctx, 0, "")
+	return r.handleCleanupPRWS(ctx, ws, 0, "")
 }
 
 // RunIssue works a single issue end-to-end: loop, cleanup, PR, checks, merge.
@@ -80,8 +86,13 @@ func RunIssue(ctx context.Context, cfg *config.Config, issueNum int) error {
 		return err
 	}
 	r.printStartupBanner(fmt.Sprintf("issue #%d on %s", issueNum, r.provider.Name()))
-	if err := r.requireCleanTree(ctx); err != nil {
-		return fmt.Errorf("issue mode requires a clean working tree (ralph will `git checkout %s && git pull` before working): %w", r.resolveDefaultBranch(ctx), err)
+	// In worktree mode the repo root is never touched, so a dirty root is fine —
+	// that's the whole point (work in the root while ralph runs). Only the
+	// in-place path needs a clean tree for its `git checkout`.
+	if !r.cfg.Worktrees {
+		if err := r.requireCleanTree(ctx); err != nil {
+			return fmt.Errorf("in-place issue mode requires a clean working tree (ralph will `git checkout %s && git pull` before working; or drop --no-worktree): %w", r.resolveDefaultBranch(ctx), err)
+		}
 	}
 	if err := r.provider.EnsureLabels(ctx, r.labels); err != nil {
 		return fmt.Errorf("ensure labels: %w", err)
@@ -112,25 +123,43 @@ func RunAuto(ctx context.Context, cfg *config.Config, once bool) error {
 	if once {
 		mode = "auto --once"
 	}
-	r.printStartupBanner(fmt.Sprintf("%s on %s", mode, r.provider.Name()))
-	if err := r.requireCleanTree(ctx); err != nil {
-		return fmt.Errorf("auto mode requires a clean working tree (ralph will `git checkout %s && git pull` before each issue): %w", r.resolveDefaultBranch(ctx), err)
+	if r.cfg.MaxParallel > 1 {
+		mode = fmt.Sprintf("%s ×%d on %s", mode, r.cfg.MaxParallel, r.provider.Name())
+	} else {
+		mode = fmt.Sprintf("%s on %s", mode, r.provider.Name())
+	}
+	r.printStartupBanner(mode)
+	// Worktree mode never touches the repo root, so the root tree can be dirty
+	// (the developer may be working in it). Only the in-place path needs it clean.
+	if !r.cfg.Worktrees {
+		if err := r.requireCleanTree(ctx); err != nil {
+			return fmt.Errorf("in-place auto mode requires a clean working tree (ralph will `git checkout %s && git pull` before each issue; or drop --no-worktree): %w", r.resolveDefaultBranch(ctx), err)
+		}
 	}
 	if err := r.provider.EnsureLabels(ctx, r.labels); err != nil {
 		return fmt.Errorf("ensure labels: %w", err)
 	}
 
+	if r.cfg.MaxParallel > 1 {
+		return r.runAutoParallel(ctx, once)
+	}
+	return r.runAutoSequential(ctx, once)
+}
+
+// runAutoSequential is the original one-issue-at-a-time loop.
+func (r *run) runAutoSequential(ctx context.Context, once bool) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		// Per-iteration sanity check: between issues, a botched recovery (e.g.
-		// failed `git checkout main` after a merge error) could leave the tree
-		// dirty. Without this guard the loop would re-fail every subsequent
-		// issue on the per-issue dirty-tree check; bail explicitly so the dev
-		// sees what happened.
-		if err := r.requireCleanTree(ctx); err != nil {
-			return fmt.Errorf("auto loop halting: %w", err)
+		// Per-iteration sanity check (in-place mode only): between issues, a
+		// botched recovery (e.g. a failed `git checkout main`) could leave the
+		// tree dirty and re-fail every subsequent issue; bail explicitly. In
+		// worktree mode the root is never touched, so there's nothing to guard.
+		if !r.cfg.Worktrees {
+			if err := r.requireCleanTree(ctx); err != nil {
+				return fmt.Errorf("auto loop halting: %w", err)
+			}
 		}
 		issue, err := r.provider.NextReady(ctx, r.labels)
 		switch {
@@ -151,45 +180,220 @@ func RunAuto(ctx context.Context, cfg *config.Config, once bool) error {
 
 		r.section(fmt.Sprintf("Picking up issue #%d: %s  (completed=%d failed=%d)", issue.Number, issue.Title, r.completed, r.failed))
 		err = r.processIssue(ctx, issue.Number)
-		if errors.Is(err, claude.ErrNotLoggedIn) {
-			// Environment problem, not an issue problem: processIssue's cleanup
-			// requeued the issue (it was not marked failed). Halt the worker with
-			// the fix rather than spinning and failing every subsequent issue
-			// identically until a human notices.
+		switch {
+		case errors.Is(err, claude.ErrNotLoggedIn):
+			// Environment problem, not an issue problem: the issue was requeued.
+			// Halt with the fix rather than spinning and failing every subsequent
+			// issue identically until a human notices.
 			return r.authFailureError(err)
-		}
-		if halt := autoHaltReason(issue.Number, r.labels.Failed, err); halt != nil {
-			// The issue was just labelled failed. Stop the worker with an exit
-			// reason rather than silently moving on — a failed run almost always
-			// needs a human to look before more work proceeds.
-			r.failed++
-			r.log(fmt.Sprintf("Issue #%d did not complete cleanly: %v", issue.Number, err))
-			return halt
-		}
-		if err != nil {
-			// Interrupted (Ctrl+C / timeout): the issue was requeued, not
-			// failed. Exit cleanly via the normal cancellation path.
+		case errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded):
+			// Interrupted (Ctrl+C / timeout): the issue was requeued, not failed.
+			// Exit cleanly via the normal cancellation path.
 			return err
+		case errors.Is(err, errIssueGone):
+			// Not actionable (closed/merged/PR) — a benign skip, neither done nor
+			// failed. It was requeued (working label cleared) by dispatchCleanup.
+			r.log(fmt.Sprintf("Issue #%d skipped — not actionable: %v", issue.Number, err))
+		case err != nil:
+			// A genuine failure: dispatchCleanup already labelled it ralph-failed.
+			// Keep working the rest of the queue rather than halting the worker.
+			r.failed++
+			r.log(fmt.Sprintf("Issue #%d failed (continuing): %v  (completed=%d failed=%d)", issue.Number, err, r.completed, r.failed))
+		default:
+			r.completed++
+			r.log(fmt.Sprintf("Issue #%d done. (completed=%d failed=%d)", issue.Number, r.completed, r.failed))
 		}
-		r.completed++
-		r.log(fmt.Sprintf("Issue #%d merged. (completed=%d failed=%d)", issue.Number, r.completed, r.failed))
 		if once {
 			return nil
 		}
 	}
 }
 
+// runAutoParallel works up to cfg.MaxParallel issues concurrently, each in its
+// own worktree, rendering a compact live status dashboard. It keeps polling and
+// dispatching as slots free up; on the first issue that ends up labelled failed
+// it stops accepting new work and drains the in-flight ones before returning.
+func (r *run) runAutoParallel(ctx context.Context, once bool) error {
+	dash := newDashboard(r.ui)
+	dash.start()
+	defer dash.stopRender()
+
+	sem := make(chan struct{}, r.cfg.MaxParallel)
+	inFlight := map[int]bool{}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	var haltErr error
+
+	halted := func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return haltErr != nil
+	}
+
+	for ctx.Err() == nil && !halted() {
+		// Acquire a slot (blocks until capacity frees up).
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			goto drain
+		}
+
+		issue, err := r.provider.NextReady(ctx, r.labels)
+		switch {
+		case errors.Is(err, vcs.ErrNoReadyIssue):
+			<-sem
+			if once {
+				goto drain
+			}
+			select {
+			case <-ctx.Done():
+				goto drain
+			case <-time.After(time.Duration(r.cfg.PollInterval) * time.Second):
+			}
+			continue
+		case err != nil:
+			<-sem
+			mu.Lock()
+			if haltErr == nil {
+				haltErr = fmt.Errorf("next ready: %w", err)
+			}
+			mu.Unlock()
+			goto drain
+		}
+
+		// A worker may have set haltErr while we were polling — don't start new
+		// work after a halt (the top-of-loop check can't catch this window).
+		if halted() {
+			<-sem
+			goto drain
+		}
+
+		mu.Lock()
+		dup := inFlight[issue.Number]
+		if !dup {
+			inFlight[issue.Number] = true
+		}
+		mu.Unlock()
+		if dup {
+			// The issue is already being worked but NextReady handed it to us
+			// again — typically because its `ready` label was re-added (someone
+			// flipped ralph-working → ready mid-run) or a prior claim didn't stick.
+			// Re-assert the working label so the next poll advances to a different
+			// issue instead of starving the others by spinning on this one.
+			if err := r.provider.MarkWorking(ctx, issue.Number, r.labels); err != nil {
+				dash.event(fmt.Sprintf("warn: re-claim #%d: %v", issue.Number, err))
+			}
+			<-sem
+			select {
+			case <-ctx.Done():
+				goto drain
+			case <-time.After(time.Second):
+			}
+			continue
+		}
+
+		// Claim the issue synchronously — remove its `ready` label NOW, before
+		// launching the worker — so the next NextReady poll returns a DIFFERENT
+		// issue. The worker's own MarkWorking is async, so without this the
+		// dispatcher keeps being handed the same oldest ready issue and
+		// parallelism ramps up slowly / appears stuck below max_parallel. The
+		// worker's later MarkWorking is idempotent.
+		if err := r.provider.MarkWorking(ctx, issue.Number, r.labels); err != nil {
+			dash.event(fmt.Sprintf("warn: claim #%d: %v", issue.Number, err))
+		}
+
+		dash.event(fmt.Sprintf("picking up #%d: %s", issue.Number, issue.Title))
+		wg.Add(1)
+		go func(num int, title string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			row := dash.addRow(num, title, nil)
+			perr := r.processIssueRow(ctx, num, row)
+			row.finish(perr)
+
+			mu.Lock()
+			delete(inFlight, num)
+			switch {
+			case perr == nil:
+				r.completed++
+			case errors.Is(perr, claude.ErrNotLoggedIn):
+				// Environment problem (no usable login) — halt the whole run with
+				// the fix; every other issue would fail identically.
+				if haltErr == nil {
+					haltErr = r.authFailureError(perr)
+				}
+			case errors.Is(perr, context.Canceled) || errors.Is(perr, context.DeadlineExceeded):
+				// Interrupted/requeued — neither done nor failed; the run is
+				// shutting down via ctx anyway.
+			case errors.Is(perr, errIssueGone):
+				// Not actionable (closed/merged/PR) — a benign skip, not a
+				// failure. dispatchCleanup requeued it (cleared the working label).
+			default:
+				// A genuine failure: it was labelled ralph-failed. Keep working
+				// the rest of the queue (no halt) — just record it.
+				r.failed++
+			}
+			completed, failed := r.completed, r.failed
+			mu.Unlock()
+			dash.setCounts(completed, failed)
+		}(issue.Number, issue.Title)
+
+		if once {
+			goto drain
+		}
+	}
+
+drain:
+	wg.Wait()
+	if haltErr != nil {
+		return haltErr
+	}
+	return ctx.Err()
+}
+
 // maxReasonLen caps the failure-reason string we post as a GitHub/GitLab
 // comment so long stack traces don't dominate the issue thread.
 const maxReasonLen = 500
 
+// errNoChanges signals that the loop produced no commits over the base branch —
+// i.e. the work already exists on the base. ralph treats this as a resolved
+// no-op (close the issue), NOT a failure. See handleCleanupPRWS / ensurePR.
+var errNoChanges = errors.New("no changes to merge")
+
+// errIssueGone signals that an issue isn't actionable — it's closed/merged, is a
+// PR, or the fetch failed — typically because it was re-dispatched after it
+// already shipped. ralph treats this as a benign skip (requeue, clear the
+// working label), NOT a failure: it must not inflate the failed count or post a
+// failure comment. See processIssueRow / dispatchCleanup.
+var errIssueGone = errors.New("issue not actionable")
+
+// noChangesNote is the comment ralph posts when it closes an issue as already
+// resolved (no commits over base).
+func noChangesNote(branch, base string) string {
+	return fmt.Sprintf("🤖 ralph found no changes were needed: branch `%s` has no commits over `%s`, so the work appears to already exist on `%s`. Closing as resolved — reopen if that's not right.", branch, base, base)
+}
+
 // run is the per-invocation state.
 type run struct {
 	cfg      *config.Config
-	session  *claude.Session
+	session  agentSession
 	provider vcs.Provider
 	labels   vcs.Labels
 	ui       io.Writer
+
+	// newSession, when set, overrides how Claude sessions are built (tests
+	// inject a fake). Production leaves it nil and uses claude.NewSession.
+	newSession sessionFactory
+
+	// gitMu serialises git commands that mutate the shared repo (.git refs and
+	// worktree admin). Concurrent `git worktree add` / `fetch` / `push` against
+	// one repo race on ref locks and fail intermittently (empirically ~1/3 of
+	// concurrent worktree adds). In parallel auto mode this guards ralph's own
+	// plumbing; it's held only for the brief command, so the per-worktree Claude
+	// work it brackets still runs fully in parallel. Uncontended in sequential
+	// mode.
+	gitMu sync.Mutex
 
 	// Claude login state for the active config dir, resolved once in newRun via
 	// `claude auth status` and reused by the startup banner (so the probe — and
@@ -231,7 +435,18 @@ func newRun(cfg *config.Config) (*run, error) {
 	if err := os.Chmod(outDir, 0o700); err != nil {
 		return nil, fmt.Errorf("chmod output dir: %w", err)
 	}
-	sess, err := claude.NewSession(claude.SessionConfig{
+	r := &run{
+		cfg: cfg,
+		labels: vcs.Labels{
+			Ready:   cfg.GitHub.Labels.Ready,
+			Working: cfg.GitHub.Labels.Working,
+			Failed:  cfg.GitHub.Labels.Failed,
+		},
+		ui:         os.Stdout,
+		authStatus: authStatus,
+		authKnown:  authKnown,
+	}
+	sess, err := r.makeSession(claude.SessionConfig{
 		Bin:             cfg.ClaudeBin,
 		WorkDir:         cfg.ProjectRoot,
 		ClaudeConfigDir: cfg.ClaudeConfigDir,
@@ -241,24 +456,22 @@ func newRun(cfg *config.Config) (*run, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &run{
-		cfg:        cfg,
-		session:    sess,
-		authStatus: authStatus,
-		authKnown:  authKnown,
-		labels: vcs.Labels{
-			Ready:   cfg.GitHub.Labels.Ready,
-			Working: cfg.GitHub.Labels.Working,
-			Failed:  cfg.GitHub.Labels.Failed,
-		},
-		ui: os.Stdout,
-	}, nil
+	r.session = sess
+	return r, nil
 }
 
 func (r *run) close() {
 	if r.session != nil {
 		_ = r.session.Close()
 	}
+}
+
+// lockedGit runs fn while holding gitMu — use it for every git command that
+// mutates the shared repo (worktree add/remove, fetch, push). See gitMu.
+func (r *run) lockedGit(fn func() error) error {
+	r.gitMu.Lock()
+	defer r.gitMu.Unlock()
+	return fn()
 }
 
 func (r *run) ensureProvider(ctx context.Context) error {
@@ -290,56 +503,87 @@ func (r *run) ensureProvider(ctx context.Context) error {
 // If the function exits with a non-nil error, the issue is marked failed and
 // any "ralph-working" label is cleared. This includes ctx cancellation so a
 // Ctrl-C mid-run doesn't leave an issue stuck in "working".
-func (r *run) processIssue(ctx context.Context, issueNum int) (resultErr error) {
+func (r *run) processIssue(ctx context.Context, issueNum int) error {
+	return r.processIssueRow(ctx, issueNum, nil)
+}
+
+// processIssueRow is processIssue parameterised by an optional dashboard row
+// (non-nil only in parallel auto mode). It prepares the workspace — a per-issue
+// git worktree by default, or the repo root in-place — runs the refine cycle in
+// it, then drives the PR through checks/merge (with repair). The worktree is
+// always torn down on exit.
+func (r *run) processIssueRow(ctx context.Context, issueNum int, row *issueRow) (resultErr error) {
 	defaultBranch := r.resolveDefaultBranch(ctx)
 
-	if err := r.requireCleanTree(ctx); err != nil {
-		return err
+	// In-place mode mutates the repo root, so it must start clean. Worktree mode
+	// leaves the root alone — skip the gate. (Pre-flight, before any label work.)
+	if !r.cfg.Worktrees {
+		if err := r.requireCleanTree(ctx); err != nil {
+			return err
+		}
 	}
 
-	// Validate FIRST — fetch and confirm the issue is open and isn't actually a
-	// PR. We do this before any label mutation or checkout so a closed-or-PR
-	// number doesn't strand the issue with ralph-working.
-	issue, err := r.provider.GetIssue(ctx, issueNum)
-	if err != nil {
-		return fmt.Errorf("fetch issue: %w", err)
-	}
-
-	if err := git.CheckoutMain(ctx, r.cfg.ProjectRoot, defaultBranch); err != nil {
-		return fmt.Errorf("sync %s: %w (commit or stash any local changes first)", defaultBranch, err)
-	}
-	if err := r.provider.MarkWorking(ctx, issueNum, r.labels); err != nil {
-		r.log(fmt.Sprintf("warn: mark working: %v", err))
-	}
-
-	// Catch-all cleanup: any non-nil exit clears the working label. On user
-	// interrupt (Ctrl+C / SIGTERM → context cancellation) we *requeue* the
-	// issue rather than marking it failed — the user almost certainly wants
-	// the next ralph run to retry it, not have it sitting in the failed pile.
+	// Catch-all cleanup: registered up front so EVERY exit path below classifies
+	// the outcome and clears any ralph-working label (the parallel dispatcher
+	// claims the issue before this worker starts). On Ctrl+C / timeout, or when
+	// the issue turns out to be gone (errIssueGone), the issue is *requeued*, not
+	// burned into the failed pile.
 	defer func() { dispatchCleanup(r.provider, issueNum, r.labels, resultErr) }()
 
-	// Guardrail: put the loop on a dedicated branch BEFORE any work, so every
-	// commit Claude makes — and any push — lands here, never on the protected
-	// default branch. This does not depend on the project's instructions doc;
-	// it is what stops a "push each session" workflow from publishing straight
-	// to the default branch (see issue/PR history). HEAD is on the freshly
-	// pulled default branch (CheckoutMain above), so the branch forks from
-	// up-to-date upstream.
-	branch := issueBranchName(r.cfg.BranchPrefix, issueNum, issue.Title)
-	if err := git.CreateWorkBranch(ctx, r.cfg.ProjectRoot, branch); err != nil {
-		return fmt.Errorf("create work branch: %w", err)
+	// Validate FIRST — confirm the issue is still open and isn't actually a PR.
+	// A closed/merged issue (e.g. re-dispatched after it already shipped) is NOT
+	// a failure: GetIssue's error is wrapped as errIssueGone so it's skipped
+	// (no ralph-failed label, no spurious failed count) and the working label is
+	// cleared by the deferred cleanup above.
+	issue, err := r.provider.GetIssue(ctx, issueNum)
+	if err != nil {
+		return fmt.Errorf("%w: %v", errIssueGone, err)
 	}
-	r.log(fmt.Sprintf("On branch %s (off %s); commits stay off %s.", branch, defaultBranch, defaultBranch))
 
-	r.section(fmt.Sprintf("Working %s issue #%d: %s", r.provider.Name(), issueNum, issue.Title))
+	// In-place mode syncs the repo root to the default branch here. Worktree mode
+	// fetches origin/<default> and cuts the worktree atomically inside
+	// makeWorkspace (under gitMu), so the root is left untouched and nothing is
+	// done here.
+	if !r.cfg.Worktrees {
+		if err := git.CheckoutMain(ctx, r.cfg.ProjectRoot, defaultBranch); err != nil {
+			return fmt.Errorf("sync %s: %w (commit or stash any local changes first)", defaultBranch, err)
+		}
+	}
 
-	workPrompt := branchContextNote(branch, defaultBranch) + "\n\n" + renderIssuePrompt(r.cfg, r.provider.Name(), issue)
+	if err := r.provider.MarkWorking(ctx, issueNum, r.labels); err != nil {
+		if row != nil {
+			row.setMessage(fmt.Sprintf("warn: mark working: %v", err))
+		} else {
+			r.log(fmt.Sprintf("warn: mark working: %v", err))
+		}
+	}
+
+	// Guardrail: put the loop on a dedicated branch BEFORE any work, so every
+	// commit Claude makes — and any push — lands there, never on the protected
+	// default branch. In worktree mode this is an isolated `git worktree` cut
+	// from origin/<default>; in-place it's `git checkout -B` in the repo root.
+	ws, err := r.makeWorkspace(ctx, issueNum, issue.Title, defaultBranch, row)
+	if err != nil {
+		return fmt.Errorf("prepare workspace: %w", err)
+	}
+	defer ws.cleanup()
+	if row != nil {
+		// Live "latest message" for the dashboard: the last line of the current
+		// Claude turn, polled each render.
+		row.setMessageFn(func() string { return lastLine(ws.session.LastTurnText()) })
+		row.setBranch(ws.branch)
+	}
+
+	ws.log(fmt.Sprintf("On branch %s (off %s); commits stay off %s.", ws.branch, defaultBranch, defaultBranch))
+	ws.section(fmt.Sprintf("Working %s issue #%d: %s", r.provider.Name(), issueNum, issue.Title))
+
+	workPrompt := branchContextNote(ws.branch, defaultBranch) + "\n\n" + renderIssuePrompt(r.cfg, r.provider.Name(), issue)
 	cleanupPrompt := renderCleanup(r.cfg, issueNum)
 
-	if err := r.cycle(ctx, workPrompt, cleanupPrompt); err != nil {
+	if err := r.cycle(ctx, ws, workPrompt, cleanupPrompt); err != nil {
 		return err
 	}
-	return r.handleCleanupPR(ctx, issueNum, issue.Title)
+	return r.handleCleanupPRWS(ctx, ws, issueNum, issue.Title)
 }
 
 // resolveDefaultBranch honours an explicit cfg.DefaultBranch first, then falls
@@ -404,11 +648,11 @@ func (r *run) requireCleanTree(ctx context.Context) error {
 // is signalled AND confirmed (by VerifyCommand when configured). Claude is
 // never told either bound, so it can't pace itself or declare "done" early just
 // because a budget is running out.
-func (r *run) cycle(ctx context.Context, workPrompt, cleanupPrompt string) error {
-	if err := r.session.Reset(); err != nil {
+func (r *run) cycle(ctx context.Context, ws *workspace, workPrompt, cleanupPrompt string) error {
+	if err := ws.session.Reset(); err != nil {
 		return fmt.Errorf("reset logs: %w", err)
 	}
-	planRel, planAbs := r.planPaths()
+	planRel, planAbs := r.planPaths(ws)
 	// Start each task with a clean plan: a stale plan left by a previous issue
 	// would mislead the first pass of this one.
 	_ = os.Remove(planAbs)
@@ -429,26 +673,26 @@ func (r *run) cycle(ctx context.Context, workPrompt, cleanupPrompt string) error
 		// counter/bounds are operator-facing only and stay out of both the prompt
 		// AND the on-disk transcript (sectionConsoleOnly), so a fresh pass can't
 		// read its own loop position back out of .ralph/output.txt.
-		if err := r.session.StartFresh(); err != nil {
+		if err := ws.session.StartFresh(); err != nil {
 			return fmt.Errorf("start pass %d: %w", i, err)
 		}
-		r.sectionConsoleOnly(fmt.Sprintf("Pass %d (min %d, max %d)", i, minPasses, maxPasses))
+		ws.sectionConsoleOnly(fmt.Sprintf("Pass %d (min %d, max %d)", i, minPasses, maxPasses))
 		prompt := workPrompt + "\n\n" + loopPrompt
 		if feedback != "" {
 			prompt += "\n\n" + feedback
 		}
-		if err := r.session.Run(ctx, prompt); err != nil {
+		if err := ws.session.Run(ctx, prompt); err != nil {
 			return fmt.Errorf("pass %d: %w", i, err)
 		}
 
-		if !sawSentinel(r.session.LastTurnText(), r.cfg.CompletionSentinel) {
+		if !sawSentinel(ws.session.LastTurnText(), r.cfg.CompletionSentinel) {
 			feedback = ""
 			continue
 		}
 		// Below the minimum floor, ignore the completion signal and keep going.
 		// Push for a genuinely deeper pass rather than a rubber-stamp re-confirm.
 		if !honorsCompletion(i, minPasses) {
-			r.log(fmt.Sprintf("Completion signalled on pass %d, but the minimum is %d — continuing to refine.", i, minPasses))
+			ws.log(fmt.Sprintf("Completion signalled on pass %d, but the minimum is %d — continuing to refine.", i, minPasses))
 			// Loop-invisible: this is appended to a fresh pass, so it must stand
 			// on its own and must not reveal that earlier passes happened.
 			feedback = "Before this can be considered finished, do a deeper, genuinely skeptical review — green tests are not proof of correctness. Re-derive the expected behavior directly from the goal and confirm the tests actually assert it (tests can be wrong, tautological, or incomplete); hunt for edge and failure cases and subtle correctness or security issues; and consider whether the solution itself should be reworked. Record anything you find under FINDINGS and fix it. Only signal completion once you genuinely cannot find anything more to improve."
@@ -457,13 +701,13 @@ func (r *run) cycle(ctx context.Context, workPrompt, cleanupPrompt string) error
 		// At/above the floor: a self-emitted token is the weakest possible
 		// oracle (models declare "done" prematurely), so confirm it against the
 		// real build/test suite when one is configured.
-		ok, out := r.confirmComplete(ctx)
+		ok, out := r.confirmComplete(ctx, ws)
 		if ok {
-			r.log("Goal reported complete and verification passed; ending refine loop.")
+			ws.log("Goal reported complete and verification passed; ending refine loop.")
 			done = true
 			continue
 		}
-		r.log("Completion was signalled but the verify command failed; continuing the loop.")
+		ws.log("Completion was signalled but the verify command failed; continuing the loop.")
 		// Loop-invisible: appended to a fresh pass; states the failure as a
 		// current fact without revealing that a prior pass claimed completion.
 		feedback = "The verification command does not pass yet:\n\n" +
@@ -471,11 +715,11 @@ func (r *run) cycle(ctx context.Context, workPrompt, cleanupPrompt string) error
 			"\n\nThe goal is not complete. Fix the underlying issues so this command passes, and do not signal completion until it does."
 	}
 	if !done {
-		r.log(fmt.Sprintf("Refine loop hit the %d-pass safety cap without a verified completion; proceeding to cleanup.", maxPasses))
+		ws.log(fmt.Sprintf("Refine loop hit the %d-pass safety cap without a verified completion; proceeding to cleanup.", maxPasses))
 	}
 
-	r.section("Cleanup pass")
-	if err := r.session.Run(ctx, cleanupPrompt); err != nil {
+	ws.section("Cleanup pass")
+	if err := ws.session.Run(ctx, cleanupPrompt); err != nil {
 		return fmt.Errorf("cleanup pass: %w", err)
 	}
 	return nil
@@ -485,14 +729,14 @@ func (r *run) cycle(ctx context.Context, workPrompt, cleanupPrompt string) error
 // loop. With no VerifyCommand configured the token is trusted (with a logged
 // caveat); otherwise the command is run in the project root and its exit status
 // is the verdict. Returns the combined output for feedback on failure.
-func (r *run) confirmComplete(ctx context.Context) (bool, string) {
+func (r *run) confirmComplete(ctx context.Context, ws *workspace) (bool, string) {
 	cmd := strings.TrimSpace(r.cfg.VerifyCommand)
 	if cmd == "" {
-		r.log("No verify_command configured — accepting the completion signal without an independent gate. Set verify_command in .go-ralph-go for a robust check.")
+		ws.log("No verify_command configured — accepting the completion signal without an independent gate. Set verify_command in .go-ralph-go for a robust check.")
 		return true, ""
 	}
-	r.log("Verifying completion: " + cmd)
-	return runVerify(ctx, r.cfg.ProjectRoot, cmd)
+	ws.log("Verifying completion: " + cmd)
+	return runVerify(ctx, ws.dir, cmd)
 }
 
 // runVerify runs cmd via `sh -c` in dir, returning whether it exited cleanly
@@ -512,9 +756,9 @@ func runVerify(ctx context.Context, dir, cmd string) (bool, string) {
 // telling Claude, which runs with cwd = project root) and absolute (for the
 // runner's own file ops). It lives under the gitignored output dir so it never
 // pollutes the user's commits/PR.
-func (r *run) planPaths() (rel, abs string) {
+func (r *run) planPaths(ws *workspace) (rel, abs string) {
 	rel = filepath.Join(r.cfg.OutputDir, "plan.md")
-	abs = filepath.Join(r.cfg.ProjectRoot, rel)
+	abs = filepath.Join(ws.dir, rel)
 	return rel, abs
 }
 
@@ -563,7 +807,18 @@ func renderRefinePrompt(cfg *config.Config, planFile string) string {
 // ad-hoc prompts (issueNum=0) it stops after ensuring the PR (no auto-merge).
 // issueTitle, when non-empty, seeds the title of any PR ralph has to open.
 func (r *run) handleCleanupPR(ctx context.Context, issueNum int, issueTitle string) error {
-	branch, err := git.CurrentBranch(ctx, r.cfg.ProjectRoot)
+	return r.handleCleanupPRWS(ctx, r.rootWorkspace(), issueNum, issueTitle)
+}
+
+// handleCleanupPRWS is handleCleanupPR scoped to a workspace (worktree or root).
+// For an issue it drives the PR all the way to merged, and — crucially — when
+// checks fail or the merge is refused (broken tests, merge conflicts) it feeds
+// the failure back to Claude as a repair pass (rebase onto the updated default
+// branch, fix, re-push) and retries, up to cfg.MergeRepairAttempts. That's what
+// lets `ralph auto` keep working an issue until it actually merges instead of
+// giving up on the first red check.
+func (r *run) handleCleanupPRWS(ctx context.Context, ws *workspace, issueNum int, issueTitle string) error {
+	branch, err := git.CurrentBranch(ctx, ws.dir)
 	if err != nil {
 		return fmt.Errorf("detect branch: %w", err)
 	}
@@ -572,44 +827,158 @@ func (r *run) handleCleanupPR(ctx context.Context, issueNum int, issueTitle stri
 		return fmt.Errorf("cleanup pass left us on %s — no feature branch to open a PR from (ralph creates one before the loop; the agent must not check out %s)", defaultBranch, defaultBranch)
 	}
 
-	pr, err := r.ensurePR(ctx, branch, defaultBranch, issueNum, issueTitle)
+	pr, err := r.ensurePR(ctx, ws, branch, defaultBranch, issueNum, issueTitle)
 	if err != nil {
+		// "Nothing to merge" because the work already exists on the base branch
+		// is a resolved/no-op outcome, not a failure: close the issue with an
+		// explanatory note instead of marking it ralph-failed. (Ad-hoc run --pr,
+		// issueNum 0, still surfaces the error — there's no issue to close.)
+		if errors.Is(err, errNoChanges) && issueNum > 0 {
+			ws.log(fmt.Sprintf("No changes needed — the work already exists on %s; closing #%d as resolved.", defaultBranch, issueNum))
+			if e := r.provider.MarkSkipped(ctx, issueNum, r.labels, noChangesNote(branch, defaultBranch)); e != nil {
+				ws.log(fmt.Sprintf("warn: mark skipped on issue #%d: %v", issueNum, e))
+			}
+			r.resetRootIfNeeded(ctx, ws, defaultBranch)
+			return nil
+		}
 		return err
 	}
 
 	if issueNum == 0 {
 		// Ad-hoc --pr mode: PR ensured but NOT auto-merged.
-		r.log(fmt.Sprintf("PR #%d ready on branch %s (no auto-merge).", pr.Number, branch))
+		ws.log(fmt.Sprintf("PR #%d ready on branch %s (no auto-merge).", pr.Number, branch))
 		if pr.URL != "" {
-			r.log("  → " + pr.URL)
+			ws.log("  → " + pr.URL)
 		}
-		_ = git.CheckoutMain(ctx, r.cfg.ProjectRoot, defaultBranch)
+		r.resetRootIfNeeded(ctx, ws, defaultBranch)
 		return nil
 	}
 
 	if pr.URL != "" {
-		r.log(fmt.Sprintf("PR #%d  →  %s", pr.Number, pr.URL))
-	}
-	r.log(fmt.Sprintf("Waiting for checks on PR #%d...", pr.Number))
-	interval := time.Duration(r.cfg.GitHub.CheckIntervalSeconds) * time.Second
-	if err := r.provider.WaitForChecks(ctx, pr.Number, interval); err != nil {
-		_ = git.CheckoutMain(ctx, r.cfg.ProjectRoot, defaultBranch)
-		return fmt.Errorf("checks failed on PR #%d: %w", pr.Number, err)
+		ws.log(fmt.Sprintf("PR #%d  →  %s", pr.Number, pr.URL))
 	}
 
-	r.log(fmt.Sprintf("Checks passed; squash-merging PR #%d...", pr.Number))
-	if err := r.provider.SquashMergeAndDelete(ctx, pr.Number); err != nil {
-		_ = git.CheckoutMain(ctx, r.cfg.ProjectRoot, defaultBranch)
-		return fmt.Errorf("merge refused on PR #%d: %w", pr.Number, err)
+	interval := time.Duration(r.cfg.GitHub.CheckIntervalSeconds) * time.Second
+	attempts := 0
+	for {
+		ws.section(fmt.Sprintf("Waiting for checks on PR #%d", pr.Number))
+		checkErr := r.provider.WaitForChecks(ctx, pr.Number, interval)
+
+		if checkErr == nil {
+			ws.section(fmt.Sprintf("Squash-merging PR #%d", pr.Number))
+			mergeErr := r.provider.SquashMergeAndDelete(ctx, pr.Number)
+			if mergeErr == nil {
+				// Defensive close: if Claude's PR body lacked "Closes #N", GitHub
+				// won't auto-close the issue on merge and ralph-working would
+				// linger forever. Best-effort — failure here doesn't undo the merge.
+				if err := r.provider.MarkResolved(ctx, issueNum, r.labels); err != nil {
+					ws.log(fmt.Sprintf("warn: mark resolved on issue #%d: %v", issueNum, err))
+				}
+				ws.log(fmt.Sprintf("Merged PR #%d.", pr.Number))
+				r.resetRootIfNeeded(ctx, ws, defaultBranch)
+				return nil
+			}
+			// Merge refused — usually the branch is behind base or conflicts.
+			if !mergeRepairable(mergeErr) || attempts >= r.cfg.MergeRepairAttempts {
+				r.resetRootIfNeeded(ctx, ws, defaultBranch)
+				return fmt.Errorf("merge refused on PR #%d: %w", pr.Number, mergeErr)
+			}
+			attempts++
+			if err := r.repairForMerge(ctx, ws, branch, defaultBranch, attempts, "the merge was refused (likely a conflict or out-of-date branch)", mergeErr.Error()); err != nil {
+				r.resetRootIfNeeded(ctx, ws, defaultBranch)
+				return err
+			}
+			continue
+		}
+
+		// Checks failed or the wait was cancelled.
+		if errors.Is(checkErr, context.Canceled) || errors.Is(checkErr, context.DeadlineExceeded) {
+			r.resetRootIfNeeded(ctx, ws, defaultBranch)
+			return checkErr
+		}
+		if attempts >= r.cfg.MergeRepairAttempts {
+			r.resetRootIfNeeded(ctx, ws, defaultBranch)
+			return fmt.Errorf("checks failed on PR #%d after %d repair attempt(s): %w", pr.Number, attempts, checkErr)
+		}
+		attempts++
+		if err := r.repairForMerge(ctx, ws, branch, defaultBranch, attempts, "the PR's CI checks failed", checkErr.Error()); err != nil {
+			r.resetRootIfNeeded(ctx, ws, defaultBranch)
+			return err
+		}
+		// Loop: WaitForChecks re-reads the PR head, so it picks up the new commits.
 	}
-	// Defensive close: if Claude's PR body lacked "Closes #N", GitHub won't
-	// auto-close the issue on merge and ralph-working would linger forever.
-	// Best-effort — failure here doesn't undo the merge.
-	if err := r.provider.MarkResolved(ctx, issueNum, r.labels); err != nil {
-		r.log(fmt.Sprintf("warn: mark resolved on issue #%d: %v", issueNum, err))
+}
+
+// resetRootIfNeeded restores the repo root to the default branch after an
+// in-place run. In worktree mode it is a no-op: the root checkout was never
+// touched (the whole point — the developer may be working in it), and the
+// worktree is removed by ws.cleanup instead.
+func (r *run) resetRootIfNeeded(ctx context.Context, ws *workspace, defaultBranch string) {
+	if ws.isWorktree {
+		return
 	}
 	_ = git.CheckoutMain(ctx, r.cfg.ProjectRoot, defaultBranch)
+}
+
+// mergeRepairable reports whether a checks/merge failure is worth a repair pass.
+// Cancellation/timeout is the user interrupting — propagate it, don't "repair".
+// Everything else (red checks, conflicts, transient merge refusals) gets a shot.
+func mergeRepairable(err error) bool {
+	return err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
+}
+
+// repairForMerge runs one Claude pass aimed squarely at making the PR mergeable:
+// rebase onto the freshly-fetched default branch, fix the failure, commit. ralph
+// then force-pushes (a repair may have rewritten history via rebase) so the next
+// WaitForChecks runs against the new head.
+func (r *run) repairForMerge(ctx context.Context, ws *workspace, branch, defaultBranch string, attempt int, what, detail string) error {
+	ws.section(fmt.Sprintf("Merge repair %d/%d — %s", attempt, r.cfg.MergeRepairAttempts, what))
+	// Refresh the base so the rebase targets up-to-date upstream.
+	if err := r.lockedGit(func() error { return git.Fetch(ctx, ws.dir, "origin", defaultBranch) }); err != nil {
+		ws.log("warn: fetch base for repair: " + err.Error())
+	}
+	planRel, _ := r.planPaths(ws)
+	prompt := renderRepairPrompt(r.cfg, planRel, branch, defaultBranch, what, truncate(detail, maxReasonLen))
+	if err := ws.session.StartFresh(); err != nil {
+		return fmt.Errorf("repair start: %w", err)
+	}
+	if err := ws.session.Run(ctx, prompt); err != nil {
+		return fmt.Errorf("repair pass: %w", err)
+	}
+	// Make sure the branch's remote-tracking ref is current before force-pushing
+	// so --force-with-lease has a baseline to compare against (the branch may
+	// have first reached the remote via Claude's own push, leaving this worktree
+	// without a tracking ref). Best-effort: a missing remote branch just means
+	// the upcoming push creates it.
+	if err := r.lockedGit(func() error {
+		_ = git.Fetch(ctx, ws.dir, "origin", branch)
+		return git.ForcePush(ctx, ws.dir, branch)
+	}); err != nil {
+		return fmt.Errorf("repair push: %w", err)
+	}
 	return nil
+}
+
+// renderRepairPrompt builds the single-turn prompt for a merge-repair pass.
+func renderRepairPrompt(cfg *config.Config, planFile, branch, defaultBranch, what, detail string) string {
+	verify := "Run the project's full build, test, and lint suite and show the real output."
+	if cmd := strings.TrimSpace(cfg.VerifyCommand); cmd != "" {
+		verify = fmt.Sprintf("Run `%s` and make sure it exits cleanly, showing its real output.", cmd)
+	}
+	return fmt.Sprintf(`You are on git branch `+"`%s`"+`, which is open as a pull request into `+"`%s`"+`. The PR is NOT mergeable yet: %s.
+
+Failure detail reported by the host:
+%s
+
+This is a single, non-interactive turn — do everything now, in the foreground, and finish before you end this response:
+1. Commit any outstanding changes on this branch so the tree is clean.
+2. Bring the branch up to date with the base: `+"`git fetch origin %s`"+`, then `+"`git rebase origin/%s`"+`. If there are conflicts, resolve them correctly (preserve both sides' intent — never discard others' work), then `+"`git rebase --continue`"+` until the rebase completes.
+3. Fix the real cause of the failure above. If tests failed, fix the CODE so they pass — never weaken, skip, xfail, comment out, hard-code around, or delete a test to go green. If the only problem was the branch being behind base, step 2 may already resolve it.
+4. %s
+5. Commit the result on `+"`%s`"+` with a clear message. Do NOT push (the harness force-pushes for you), do NOT open a new PR (one already exists), and do NOT switch to or commit on `+"`%s`"+`.
+
+Keep `+"`%s`"+` accurate. Work only on making this PR mergeable; add nothing unrelated.`,
+		branch, defaultBranch, what, detail, defaultBranch, defaultBranch, verify, branch, defaultBranch, planFile)
 }
 
 // ensurePR returns the open PR/MR for branch, opening one itself if the cleanup
@@ -619,7 +988,7 @@ func (r *run) handleCleanupPR(ctx context.Context, issueNum int, issueTitle stri
 // backgrounded a long test gate). When no PR exists ralph pushes the branch and
 // opens the PR; if the branch carries no commits over base there is genuinely
 // nothing to do, so it surfaces that clearly instead of opening an empty PR.
-func (r *run) ensurePR(ctx context.Context, branch, baseBranch string, issueNum int, issueTitle string) (*vcs.PR, error) {
+func (r *run) ensurePR(ctx context.Context, ws *workspace, branch, baseBranch string, issueNum int, issueTitle string) (*vcs.PR, error) {
 	pr, err := r.provider.FindPRForBranch(ctx, branch)
 	if err != nil {
 		return nil, fmt.Errorf("find PR: %w", err)
@@ -629,12 +998,17 @@ func (r *run) ensurePR(ctx context.Context, branch, baseBranch string, issueNum 
 	}
 
 	// No PR yet — the cleanup pass committed work but didn't open one. Confirm
-	// there is actually work to merge before doing anything remote.
-	if ahead, err := git.CommitsAhead(ctx, r.cfg.ProjectRoot, baseBranch, branch); err == nil && ahead == 0 {
-		return nil, fmt.Errorf("branch %s has no commits over %s — the loop produced no changes to open a PR for", branch, baseBranch)
+	// there is actually work to merge before doing anything remote. In worktree
+	// mode the branch was cut from origin/<base>, so compare against that.
+	base := baseBranch
+	if ws.isWorktree {
+		base = "origin/" + baseBranch
 	}
-	r.log(fmt.Sprintf("No PR found for branch %s — pushing and opening one.", branch))
-	if err := git.Push(ctx, r.cfg.ProjectRoot, branch); err != nil {
+	if ahead, err := git.CommitsAhead(ctx, ws.dir, base, branch); err == nil && ahead == 0 {
+		return nil, fmt.Errorf("%w: branch %s has no commits over %s", errNoChanges, branch, base)
+	}
+	ws.log(fmt.Sprintf("No PR found for branch %s — pushing and opening one.", branch))
+	if err := r.lockedGit(func() error { return git.Push(ctx, ws.dir, branch) }); err != nil {
 		return nil, err
 	}
 	title, body := ralphPRContent(issueNum, issueTitle, branch)
@@ -642,7 +1016,7 @@ func (r *run) ensurePR(ctx context.Context, branch, baseBranch string, issueNum 
 	if err != nil {
 		return nil, fmt.Errorf("open PR for branch %s: %w", branch, err)
 	}
-	r.log(fmt.Sprintf("Opened PR #%d (ralph fallback — cleanup pass did not open it).", pr.Number))
+	ws.log(fmt.Sprintf("Opened PR #%d (ralph fallback — cleanup pass did not open it).", pr.Number))
 	return pr, nil
 }
 
