@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/chuntley/go-ralph-go/compare/v0.5.0...v0.6.0) (2026-07-22)
+
+
+### Features
+
+* resilient refine passes and branch-resume on re-run ([#24](https://github.com/chuntley/go-ralph-go/issues/24)) ([b0ae095](https://github.com/chuntley/go-ralph-go/commit/b0ae095eafbfe4fb64d367885a4b98d0fecb9a69))
+
 ## [0.5.0](https://github.com/chuntley/go-ralph-go/compare/v0.4.0...v0.5.0) (2026-06-29)
 
 
