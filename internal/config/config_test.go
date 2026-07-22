@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/BurntSushi/toml"
 )
@@ -47,6 +48,59 @@ func TestValidateClampsMinToMax(t *testing.T) {
 	c.Iterations = 5
 	if err := c.Validate(); err != nil {
 		t.Errorf("min == max should be valid, got: %v", err)
+	}
+}
+
+func TestValidatePassTimeoutAndRetries(t *testing.T) {
+	// A valid duration string parses into PassTimeoutDur.
+	c := Defaults()
+	c.PassTimeout = "45m"
+	if err := c.Validate(); err != nil {
+		t.Fatalf("valid pass_timeout should parse: %v", err)
+	}
+	if c.PassTimeoutDur != 45*time.Minute {
+		t.Errorf("pass_timeout not parsed: got %v, want 45m", c.PassTimeoutDur)
+	}
+
+	// Empty = no cap.
+	c = Defaults()
+	c.PassTimeout = ""
+	if err := c.Validate(); err != nil {
+		t.Fatalf("empty pass_timeout should be valid: %v", err)
+	}
+	if c.PassTimeoutDur != 0 {
+		t.Errorf("empty pass_timeout should give 0 (no cap), got %v", c.PassTimeoutDur)
+	}
+
+	// A garbage duration is rejected.
+	c = Defaults()
+	c.PassTimeout = "banana"
+	if err := c.Validate(); err == nil {
+		t.Error("expected error on unparseable pass_timeout")
+	}
+
+	// A non-positive duration is rejected.
+	c = Defaults()
+	c.PassTimeout = "0s"
+	if err := c.Validate(); err == nil {
+		t.Error("expected error on non-positive pass_timeout")
+	}
+	c = Defaults()
+	c.PassTimeout = "-1m"
+	if err := c.Validate(); err == nil {
+		t.Error("expected error on negative pass_timeout")
+	}
+
+	// Negative pass_retries is rejected; 0 is allowed (fail on first crash).
+	c = Defaults()
+	c.PassRetries = -1
+	if err := c.Validate(); err == nil {
+		t.Error("expected error on negative pass_retries")
+	}
+	c = Defaults()
+	c.PassRetries = 0
+	if err := c.Validate(); err != nil {
+		t.Errorf("pass_retries=0 should be valid (fail on first crash): %v", err)
 	}
 }
 
@@ -208,6 +262,12 @@ func TestDefaultsMatchDocumentation(t *testing.T) {
 	}
 	if c.MergeRepairAttempts != 3 {
 		t.Errorf("MergeRepairAttempts default: got %d, want 3", c.MergeRepairAttempts)
+	}
+	if c.PassRetries != 2 {
+		t.Errorf("PassRetries default: got %d, want 2", c.PassRetries)
+	}
+	if c.PassTimeout != "" || c.PassTimeoutDur != 0 {
+		t.Errorf("PassTimeout default: got %q / %v, want empty / 0 (no cap)", c.PassTimeout, c.PassTimeoutDur)
 	}
 	if c.GitHub.CheckIntervalSeconds != 30 {
 		t.Errorf("GitHub.CheckIntervalSeconds default: got %d, want 30", c.GitHub.CheckIntervalSeconds)

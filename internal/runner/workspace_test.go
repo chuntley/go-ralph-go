@@ -148,3 +148,85 @@ func TestMakeWorkspaceInPlace(t *testing.T) {
 		t.Errorf("in-place mode should check out the branch in the root; got %q", br)
 	}
 }
+
+// TestMakeWorkspaceResumesExistingBranch is the guarantee that re-running a
+// failed/interrupted issue does not lose prior work: the worktree dir is
+// disposable (always torn down), but its commits live on the issue branch, and a
+// second run rebuilds the worktree FROM that branch rather than resetting it to
+// upstream.
+func TestMakeWorkspaceResumesExistingBranch(t *testing.T) {
+	ctx := context.Background()
+	root := initRepoWithOriginOnMain(t)
+
+	cfg := config.Defaults()
+	cfg.ProjectRoot = root
+	cfg.WorktreeDir = t.TempDir()
+	r := &run{cfg: &cfg, ui: io.Discard}
+
+	// First run: fresh worktree off origin/main; commit "prior work"; tear down.
+	ws1, err := r.makeWorkspace(ctx, 7, "Fix the thing", "main", nil)
+	if err != nil {
+		t.Fatalf("makeWorkspace #1: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(ws1.dir, "prior.txt"), []byte("work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGitCmd(t, ws1.dir, "add", ".")
+	mustGitCmd(t, ws1.dir, "commit", "-m", "prior committed work")
+	ws1.cleanup() // removes the worktree dir; branch keeps the commit
+
+	if _, err := os.Stat(ws1.dir); !os.IsNotExist(err) {
+		t.Fatalf("teardown should remove the worktree dir (err=%v)", err)
+	}
+
+	// Second run for the SAME issue: must resume the branch, preserving prior.txt.
+	ws2, err := r.makeWorkspace(ctx, 7, "Fix the thing", "main", nil)
+	if err != nil {
+		t.Fatalf("makeWorkspace #2: %v", err)
+	}
+	defer ws2.cleanup()
+	if _, err := os.Stat(filepath.Join(ws2.dir, "prior.txt")); err != nil {
+		t.Errorf("re-run should preserve prior committed work on the branch: %v", err)
+	}
+	if br, _ := git.CurrentBranch(ctx, ws2.dir); br != "ralph/issue-7-fix-the-thing" {
+		t.Errorf("resumed worktree HEAD = %q; want the issue branch", br)
+	}
+}
+
+// TestMakeWorkspaceInPlaceResumesExistingBranch is the in-place (--no-worktree)
+// counterpart of TestMakeWorkspaceResumesExistingBranch: a re-run must resume the
+// existing branch rather than -B-resetting it and discarding committed work.
+func TestMakeWorkspaceInPlaceResumesExistingBranch(t *testing.T) {
+	ctx := context.Background()
+	root := initRepoWithOriginOnMain(t)
+
+	cfg := config.Defaults()
+	cfg.Worktrees = false
+	cfg.ProjectRoot = root
+	r := newRunForTest(t, root, "main", &fakeProvider{})
+	r.cfg = &cfg
+
+	// First run: create the branch in-place, commit "prior work".
+	if _, err := r.makeWorkspace(ctx, 9, "Do it", "main", nil); err != nil {
+		t.Fatalf("makeWorkspace #1: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "prior.txt"), []byte("work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGitCmd(t, root, "add", ".")
+	mustGitCmd(t, root, "commit", "-m", "prior committed work")
+
+	// Between issues the root is synced back to the default branch.
+	mustGitCmd(t, root, "checkout", "main")
+
+	// Second run for the SAME issue: must resume the branch, preserving prior.txt.
+	if _, err := r.makeWorkspace(ctx, 9, "Do it", "main", nil); err != nil {
+		t.Fatalf("makeWorkspace #2: %v", err)
+	}
+	if br, _ := git.CurrentBranch(ctx, root); br != "ralph/issue-9-do-it" {
+		t.Errorf("re-run should be on the issue branch; got %q", br)
+	}
+	if _, err := os.Stat(filepath.Join(root, "prior.txt")); err != nil {
+		t.Errorf("in-place re-run should preserve prior committed work: %v", err)
+	}
+}

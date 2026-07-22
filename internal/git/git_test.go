@@ -371,3 +371,76 @@ func TestForcePushAfterRebase(t *testing.T) {
 		t.Fatalf("ForcePush after rewrite should succeed: %v", err)
 	}
 }
+
+func TestLocalBranchExists(t *testing.T) {
+	ctx := context.Background()
+	dir := initRepo(t, "main")
+	if !LocalBranchExists(ctx, dir, "main") {
+		t.Error("main should exist")
+	}
+	if LocalBranchExists(ctx, dir, "ralph/issue-1-nope") {
+		t.Error("a never-created branch should not exist")
+	}
+	mustGit(t, dir, "branch", "ralph/issue-1-work")
+	if !LocalBranchExists(ctx, dir, "ralph/issue-1-work") {
+		t.Error("branch should exist after creation")
+	}
+}
+
+// TestAddWorktreeResumePreservesCommits is the guarantee behind resuming a
+// failed issue: a branch's committed work survives a worktree teardown and is
+// restored when a fresh worktree is cut from that branch. It also exercises
+// RemoveWorktree's unconditional prune (otherwise the re-add would fail with
+// "branch already checked out").
+func TestAddWorktreeResumePreservesCommits(t *testing.T) {
+	ctx := context.Background()
+	dir := initRepo(t, "main")
+
+	// Commit "prior work" onto branch `work` via a scratch worktree, then remove it.
+	scratch := filepath.Join(t.TempDir(), "scratch")
+	if err := AddWorktree(ctx, dir, scratch, "work", "main"); err != nil {
+		t.Fatalf("AddWorktree: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(scratch, "feature.txt"), []byte("done\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, scratch, "add", ".")
+	mustGit(t, scratch, "commit", "-m", "feature work")
+	if err := RemoveWorktree(ctx, dir, scratch); err != nil {
+		t.Fatalf("RemoveWorktree: %v", err)
+	}
+
+	// Resume `work` in a NEW worktree — the committed file must be present.
+	resumed := filepath.Join(t.TempDir(), "resumed")
+	if err := AddWorktreeResume(ctx, dir, resumed, "work"); err != nil {
+		t.Fatalf("AddWorktreeResume: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(resumed, "feature.txt")); err != nil {
+		t.Errorf("resume should preserve the branch's committed work: %v", err)
+	}
+	if br, _ := CurrentBranch(ctx, resumed); br != "work" {
+		t.Errorf("resumed worktree HEAD = %q; want work", br)
+	}
+}
+
+// TestRemoveWorktreePrunesAfterDirDeleted simulates a hard-killed run whose
+// worktree directory vanished but whose registration lingered: RemoveWorktree
+// must still prune it so the branch can be re-added elsewhere.
+func TestRemoveWorktreePrunesAfterDirDeleted(t *testing.T) {
+	ctx := context.Background()
+	dir := initRepo(t, "main")
+
+	wt := filepath.Join(t.TempDir(), "gone")
+	if err := AddWorktree(ctx, dir, wt, "orphan", "main"); err != nil {
+		t.Fatalf("AddWorktree: %v", err)
+	}
+	if err := os.RemoveAll(wt); err != nil { // hard-kill: dir gone, registration stale
+		t.Fatal(err)
+	}
+	_ = RemoveWorktree(ctx, dir, wt) // remove errors (dir gone) but must still prune
+
+	again := filepath.Join(t.TempDir(), "again")
+	if err := AddWorktreeResume(ctx, dir, again, "orphan"); err != nil {
+		t.Fatalf("stale registration should have been pruned, got: %v", err)
+	}
+}

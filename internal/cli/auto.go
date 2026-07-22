@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/chuntley/go-ralph-go/internal/config"
 	"github.com/chuntley/go-ralph-go/internal/runner"
@@ -16,6 +17,8 @@ func newAutoCmd() *cobra.Command {
 	var pollSeconds int
 	var noWorktree bool
 	var parallel int
+	var passTimeout time.Duration
+	var passRetries int
 
 	cmd := &cobra.Command{
 		Use:   "auto",
@@ -25,7 +28,7 @@ func newAutoCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("load config: %w", err)
 			}
-			if err := applyOverrides(cfg, minIterations, iterations, instructionsDoc); err != nil {
+			if err := applyOverrides(cfg, minIterations, iterations, instructionsDoc, passTimeout, passRetries); err != nil {
 				return err
 			}
 			if pollSeconds > 0 {
@@ -54,5 +57,7 @@ func newAutoCmd() *cobra.Command {
 	cmd.Flags().IntVar(&pollSeconds, "poll", 0, "override poll interval in seconds (min 30; default from config / 60)")
 	cmd.Flags().BoolVar(&noWorktree, "no-worktree", false, "disable per-issue worktree isolation; work in-place in the repo root (requires a clean tree)")
 	cmd.Flags().IntVar(&parallel, "parallel", 0, "work up to N issues concurrently, each in its own worktree")
+	cmd.Flags().DurationVar(&passTimeout, "pass-timeout", 0, "cap each refine pass (e.g. 45m); 0 = no cap. On timeout the pass is retried in place")
+	cmd.Flags().IntVar(&passRetries, "pass-retries", -1, "retries for a crashed/timed-out pass, in place on the same worktree (default from config; 0 = fail on first)")
 	return cmd
 }
