@@ -90,6 +90,26 @@ go vet ./...
 
 These are the same commands CI runs. Pre-push checklist: all three clean.
 
+The `main` package is `./cmd/ralph` (module `github.com/chuntley/go-ralph-go`).
+
+### Updating your local install from source
+
+`install.sh` downloads a released binary into `$RALPH_INSTALL_DIR` (default
+`~/.local/bin/ralph`). To put an unreleased source build there — e.g. to test a
+fix before it ships — rebuild with the same version ldflag `goreleaser` uses and
+overwrite the installed binary. Use a `-dev` suffix so `ralph version` makes the
+provenance obvious:
+
+```bash
+go build -ldflags='-s -w -X github.com/chuntley/go-ralph-go/internal/cli.version=v0.6.1-dev' \
+  -o ~/.local/bin/ralph ./cmd/ralph
+ralph version   # -> ralph v0.6.1-dev
+```
+
+Omit the `-X ...version=` ldflag and the build falls back to
+`runtime/debug.ReadBuildInfo` (pseudo-version / `+dirty` SHA) — fine, but the
+explicit stamp reads more clearly.
+
 ## Running ralph on this repo
 
 This repo dogfoods itself. To run ralph against itself:
@@ -118,6 +138,16 @@ Driven entirely by commits to `main`:
 3. Merging the release PR creates a `vX.Y.Z` tag.
 4. The tag triggers `goreleaser` to build cross-platform binaries
    (darwin/linux × amd64/arm64) and publish them as a GitHub Release.
+
+> ⚠️ **Never create a `vX.Y.Z` tag by hand.** `goreleaser` runs from the tag
+> that the release PR merge creates; a manually pushed tag races or bypasses
+> that workflow, so no binaries get attached to the Release — and `install.sh`,
+> which downloads the release asset, then fails for everyone. Cutting a release
+> always means merging `release-please`'s Release PR, never `git tag`.
+
+To ship a patch: land a `fix:` (or other patch-type) commit on `main`, wait for
+`release-please` to open the Release PR, then merge it. That's the entire
+release action — no tagging, no local goreleaser run.
 
 Version baking: `goreleaser` injects the tag into
 `github.com/chuntley/go-ralph-go/internal/cli.version` via `ldflags`, so
