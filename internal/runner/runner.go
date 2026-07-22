@@ -701,7 +701,7 @@ func (r *run) cycle(ctx context.Context, ws *workspace, workPrompt, cleanupPromp
 			ws.log(fmt.Sprintf("Completion signalled on pass %d, but the minimum is %d — continuing to refine.", i, minPasses))
 			// Loop-invisible: this is appended to a fresh pass, so it must stand
 			// on its own and must not reveal that earlier passes happened.
-			feedback = "Before this can be considered finished, do a deeper, genuinely skeptical review — green tests are not proof of correctness. Re-derive the expected behavior directly from the goal and confirm the tests actually assert it (tests can be wrong, tautological, or incomplete); hunt for edge and failure cases and subtle correctness or security issues; and consider whether the solution itself should be reworked. Record anything you find under FINDINGS and fix it. Only signal completion once you genuinely cannot find anything more to improve."
+			feedback = "Before this can be considered finished, do a deeper, genuinely skeptical review — green tests are not proof of correctness. Re-derive the expected behavior directly from the goal and confirm the tests actually assert it (tests can be wrong, tautological, or incomplete); hunt for edge and failure cases and subtle correctness or security issues; and consider whether the solution itself should be reworked. Record anything you find under FINDINGS and fix what is material. Signal completion once the goal is correct, complete, and verified — leaving only non-material polish, which belongs in FINDINGS rather than blocking completion."
 			continue
 		}
 		// At/above the floor: a self-emitted token is the weakest possible
