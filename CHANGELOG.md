@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/chuntley/go-ralph-go/compare/v0.6.0...v0.6.1) (2026-07-22)
+
+
+### Bug Fixes
+
+* bound the refine-loop completion gate so it converges on capable models ([#27](https://github.com/chuntley/go-ralph-go/issues/27)) ([21c5b41](https://github.com/chuntley/go-ralph-go/commit/21c5b41a0d651b2c087458081c02c3dda055f121))
+
 ## [0.6.0](https://github.com/chuntley/go-ralph-go/compare/v0.5.0...v0.6.0) (2026-07-22)
 
 
