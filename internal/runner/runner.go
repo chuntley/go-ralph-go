@@ -386,6 +386,11 @@ type run struct {
 	// inject a fake). Production leaves it nil and uses claude.NewSession.
 	newSession sessionFactory
 
+	// passRetryBackoff is the pause between retries of a crashed/timed-out pass.
+	// Set to defaultPassRetryBackoff in newRun; tests build run literals and leave
+	// it 0 so retries don't sleep.
+	passRetryBackoff time.Duration
+
 	// gitMu serialises git commands that mutate the shared repo (.git refs and
 	// worktree admin). Concurrent `git worktree add` / `fetch` / `push` against
 	// one repo race on ref locks and fail intermittently (empirically ~1/3 of
@@ -442,9 +447,10 @@ func newRun(cfg *config.Config) (*run, error) {
 			Working: cfg.GitHub.Labels.Working,
 			Failed:  cfg.GitHub.Labels.Failed,
 		},
-		ui:         os.Stdout,
-		authStatus: authStatus,
-		authKnown:  authKnown,
+		ui:               os.Stdout,
+		authStatus:       authStatus,
+		authKnown:        authKnown,
+		passRetryBackoff: defaultPassRetryBackoff,
 	}
 	sess, err := r.makeSession(claude.SessionConfig{
 		Bin:             cfg.ClaudeBin,
@@ -681,8 +687,8 @@ func (r *run) cycle(ctx context.Context, ws *workspace, workPrompt, cleanupPromp
 		if feedback != "" {
 			prompt += "\n\n" + feedback
 		}
-		if err := ws.session.Run(ctx, prompt); err != nil {
-			return fmt.Errorf("pass %d: %w", i, err)
+		if err := r.runGuarded(ctx, ws, fmt.Sprintf("pass %d", i), prompt); err != nil {
+			return err
 		}
 
 		if !sawSentinel(ws.session.LastTurnText(), r.cfg.CompletionSentinel) {
@@ -719,10 +725,115 @@ func (r *run) cycle(ctx context.Context, ws *workspace, workPrompt, cleanupPromp
 	}
 
 	ws.section("Cleanup pass")
-	if err := ws.session.Run(ctx, cleanupPrompt); err != nil {
-		return fmt.Errorf("cleanup pass: %w", err)
+	if err := r.runGuarded(ctx, ws, "cleanup pass", cleanupPrompt); err != nil {
+		return err
 	}
 	return nil
+}
+
+// defaultPassRetryBackoff is the pause between retries of a crashed/timed-out
+// Claude turn — long enough to let transient pressure (e.g. the memory spike
+// that triggered an OOM kill) clear, short enough not to stall the loop.
+const defaultPassRetryBackoff = 3 * time.Second
+
+// runGuarded runs one Claude turn against the workspace — a refine pass, the
+// cleanup pass, or a merge-repair pass, named by label (e.g. "pass 3", "cleanup
+// pass", "repair pass 2") — applying the per-pass timeout (cfg.PassTimeout) and
+// the crash/timeout retry policy (cfg.PassRetries). It delegates to
+// runPassWithRetry so the policy stays unit-testable without a live session.
+//
+// Like the refine loop, callers that want attempt 0 to start from a fresh Claude
+// session must StartFresh before calling; the guard only resets the session on a
+// retry, so whatever state attempt 0 used, a crash-retry starts clean.
+func (r *run) runGuarded(ctx context.Context, ws *workspace, label, prompt string) error {
+	return runPassWithRetry(ctx, label, r.cfg.PassRetries, r.cfg.PassTimeoutDur, r.passRetryBackoff,
+		ws.session.StartFresh,
+		func(passCtx context.Context) error { return ws.session.Run(passCtx, prompt) },
+		ws.log)
+}
+
+// runPassWithRetry runs runOnce under an optional per-pass timeout and retries a
+// crashed or timed-out turn in place up to `retries` times, calling startFresh
+// (a new claude session on the same worktree) before each retry and logf to
+// report it. Committed work lives on the branch/worktree, so a retry rebuilds on
+// it — only the failed attempt's uncommitted work is redone.
+//
+// A timeout surfaces as context.DeadlineExceeded while the parent ctx is still
+// live, so it flows through the same retry path as a subprocess crash. Two things
+// are deliberately NOT retried, because a re-run can't fix them: a parent-ctx
+// cancellation (real Ctrl+C / SIGTERM to ralph → the issue should requeue) and
+// claude.ErrNotLoggedIn (an auth/environment problem → the run halts). Both are
+// returned wrapped so dispatchCleanup classifies them correctly. Once retries are
+// exhausted the error is returned WITHOUT wrapping the underlying context error,
+// so a persistently timing-out turn is treated as a genuine failure (MarkFailed)
+// rather than reclassified as a requeue.
+func runPassWithRetry(
+	ctx context.Context,
+	label string,
+	retries int,
+	timeout, backoff time.Duration,
+	startFresh func() error,
+	runOnce func(context.Context) error,
+	logf func(string),
+) error {
+	var runErr error
+	for attempt := 0; ; attempt++ {
+		if attempt > 0 {
+			logf(fmt.Sprintf("%s %s — retry %d/%d (same worktree)",
+				label, passFailDesc(runErr, timeout), attempt, retries))
+			if err := sleepCtx(ctx, backoff); err != nil {
+				return fmt.Errorf("%s: %w", label, err) // Ctrl+C during the backoff
+			}
+			if err := startFresh(); err != nil {
+				return fmt.Errorf("start %s retry %d: %w", label, attempt, err)
+			}
+		}
+
+		passCtx := ctx
+		var cancel context.CancelFunc
+		if timeout > 0 {
+			passCtx, cancel = context.WithTimeout(ctx, timeout)
+		}
+		runErr = runOnce(passCtx)
+		if cancel != nil {
+			cancel()
+		}
+		if runErr == nil {
+			return nil
+		}
+		// Not retryable: propagate so the caller requeues (ctx) or halts (auth).
+		if ctx.Err() != nil || errors.Is(runErr, claude.ErrNotLoggedIn) {
+			return fmt.Errorf("%s: %w", label, runErr)
+		}
+		if attempt >= retries {
+			return fmt.Errorf("%s failed after %d retries: %s", label, retries, redactSecrets(runErr.Error()))
+		}
+	}
+}
+
+// passFailDesc renders a short reason for a retryable pass failure: a per-pass
+// timeout vs a subprocess crash. Secrets in the crash text are redacted since it
+// reaches the operator log.
+func passFailDesc(err error, timeout time.Duration) string {
+	if timeout > 0 && errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Sprintf("timed out after %s", timeout)
+	}
+	return "crashed: " + redactSecrets(err.Error())
+}
+
+// sleepCtx waits d, or returns early with ctx.Err() if ctx is cancelled first.
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
 // confirmComplete decides whether a completion signal should actually end the
@@ -942,8 +1053,8 @@ func (r *run) repairForMerge(ctx context.Context, ws *workspace, branch, default
 	if err := ws.session.StartFresh(); err != nil {
 		return fmt.Errorf("repair start: %w", err)
 	}
-	if err := ws.session.Run(ctx, prompt); err != nil {
-		return fmt.Errorf("repair pass: %w", err)
+	if err := r.runGuarded(ctx, ws, fmt.Sprintf("repair pass %d", attempt), prompt); err != nil {
+		return err
 	}
 	// Make sure the branch's remote-tracking ref is current before force-pushing
 	// so --force-with-lease has a baseline to compare against (the branch may
@@ -1179,6 +1290,11 @@ func (r *run) printStartupBanner(mode string) {
 		verify = "(none — completion signal trusted as-is)"
 	}
 	fmt.Fprintf(r.ui, "  passes       : min %d, max %d\n", r.cfg.MinIterations, r.cfg.Iterations)
+	passTimeout := "off"
+	if r.cfg.PassTimeoutDur > 0 {
+		passTimeout = r.cfg.PassTimeoutDur.String()
+	}
+	fmt.Fprintf(r.ui, "  pass guard   : retries %d, timeout %s\n", r.cfg.PassRetries, passTimeout)
 	fmt.Fprintf(r.ui, "  verify cmd   : %s\n", verify)
 	fmt.Fprintf(r.ui, "  output dir   : %s\n", filepath.Join(r.cfg.ProjectRoot, r.cfg.OutputDir))
 	fmt.Fprintln(r.ui)

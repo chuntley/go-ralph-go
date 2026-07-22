@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 )
@@ -157,6 +159,28 @@ type Config struct {
 	// behaviour).
 	MergeRepairAttempts int `toml:"merge_repair_attempts"`
 
+	// PassTimeout optionally caps the wall-clock time a single refine pass may
+	// run, as a Go duration string (e.g. "45m"). Empty (default) = no cap. When a
+	// pass exceeds it, ralph cancels the claude subprocess (graceful SIGINT, then
+	// SIGKILL after a short grace) and — exactly like a crashed pass — retries it
+	// in place on the same worktree (see PassRetries), so committed work is
+	// preserved. Parsed into PassTimeoutDur by Validate.
+	PassTimeout string `toml:"pass_timeout"`
+
+	// PassTimeoutDur is PassTimeout parsed to a duration. Runtime-only (0 = no
+	// cap); populated by Validate, never read from the file.
+	PassTimeoutDur time.Duration `toml:"-"`
+
+	// PassRetries caps how many times a crashed OR timed-out refine pass is
+	// retried in place, against the same worktree, before the issue is marked
+	// failed. The worktree keeps every committed pass, so only the failed
+	// attempt's own uncommitted work is redone. A crash here means the claude
+	// subprocess exited non-zero (e.g. OOM/SIGTERM) or hit PassTimeout — not a
+	// Ctrl+C or an auth failure, neither of which is ever retried. Default: 2.
+	// 0 = fail on the first crash/timeout (previous behaviour). Distinct from
+	// MergeRepairAttempts, which governs the post-PR checks/merge phase.
+	PassRetries int `toml:"pass_retries"`
+
 	// GitHub holds GitHub-specific overrides.
 	GitHub GitHubConfig `toml:"github"`
 }
@@ -235,6 +259,7 @@ COMPLETION: A passing VERIFY command is necessary but NOT sufficient — green t
 		Worktrees:           true,
 		MaxParallel:         3,
 		MergeRepairAttempts: 3,
+		PassRetries:         2,
 		GitHub: GitHubConfig{
 			Labels: LabelConfig{
 				Ready:   "ready",
@@ -280,6 +305,22 @@ func (c *Config) Validate() error {
 	}
 	if c.MergeRepairAttempts < 0 {
 		return fmt.Errorf("merge_repair_attempts must be >= 0 (got %d)", c.MergeRepairAttempts)
+	}
+	if c.PassRetries < 0 {
+		return fmt.Errorf("pass_retries must be >= 0 (got %d)", c.PassRetries)
+	}
+	// pass_timeout is an optional Go duration string; parse it once here into the
+	// runtime-only PassTimeoutDur so the hot path never re-parses. Empty = no cap.
+	c.PassTimeoutDur = 0
+	if s := strings.TrimSpace(c.PassTimeout); s != "" {
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			return fmt.Errorf("pass_timeout %q is not a valid duration (e.g. \"45m\"): %w", c.PassTimeout, err)
+		}
+		if d <= 0 {
+			return fmt.Errorf("pass_timeout must be a positive duration (got %q)", c.PassTimeout)
+		}
+		c.PassTimeoutDur = d
 	}
 	return nil
 }
@@ -474,6 +515,16 @@ const starterTOML = `# go-ralph-go project config — defaults shown, uncomment 
 #                                 # (broken tests / conflicts), how many times to
 #                                 # feed the failure back to Claude (rebase, fix,
 #                                 # re-push) before retrying the merge. 0 disables.
+# pass_timeout     = ""           # optional wall-clock cap per refine pass, as a
+#                                 # Go duration (e.g. "45m"); "" = no cap. On a
+#                                 # timeout the claude subprocess is cancelled and
+#                                 # the pass is retried in place (see pass_retries),
+#                                 # preserving every committed pass on the worktree.
+# pass_retries     = 2            # how many times a crashed OR timed-out refine
+#                                 # pass is retried in place on the same worktree
+#                                 # before the issue is marked failed (DEFAULT 2).
+#                                 # 0 = fail on the first crash/timeout. Ctrl+C and
+#                                 # auth failures are never retried.
 # branch_prefix    = "ralph"      # namespace for the per-task branch ralph
 #                                 # creates before the loop in PR-opening modes
 #                                 # (issue/auto/run --pr): "ralph/issue-<N>-<slug>".

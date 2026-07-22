@@ -42,12 +42,12 @@ go build -o ~/bin/ralph ./cmd/ralph
 For each task ralph receives, it:
 
 1. **Isolates in a worktree** — by default each issue is worked in its **own `git worktree`** (a separate checkout cut from up-to-date upstream), on a dedicated branch (`ralph/issue-<N>-<slug>`, configurable via `branch_prefix`). The repo root is **never touched** — so you can keep working in it (even with a dirty tree) while ralph runs, and ralph can work several issues at once without them colliding. The branch is a hard guardrail: every commit Claude makes — and any push — lands there, never on the protected default branch. (Set `worktrees = false` / `--no-worktree` to work in-place in the repo root the old way, which requires a clean tree.)
-2. **Refines toward the goal** — treats the work prompt as a *goal* and loops Claude over it, keeping durable state in a plan file on disk. It always runs at least `min_iterations` passes (default 5) — early "done" signals are ignored so the work gets real re-audits — then ends as soon as Claude signals the goal is complete (confirmed by your `verify_command` when set), up to a max-passes cap (`iterations`, default 10). Claude is never told either bound.
+2. **Refines toward the goal** — treats the work prompt as a *goal* and loops Claude over it, keeping durable state in a plan file on disk. It always runs at least `min_iterations` passes (default 5) — early "done" signals are ignored so the work gets real re-audits — then ends as soon as Claude signals the goal is complete (confirmed by your `verify_command` when set), up to a max-passes cap (`iterations`, default 10). Claude is never told either bound. A pass that **crashes** (the `claude` process is killed — e.g. an OOM) or exceeds an optional `pass_timeout` is **retried in place** on the same worktree (up to `pass_retries`, default 2) rather than failing the whole issue.
 3. **Cleans up** — runs a final pass telling Claude to push the branch and open a PR (matching your project's `AGENTS.md` / `CLAUDE.md` style guide). This pass is a single non-interactive turn, so the prompt tells Claude to finish synchronously and not background work or defer the push. If it commits work but still doesn't open the PR, **ralph pushes the branch and opens the PR itself** — so a run never fails just because the agent ran out of turn.
 4. **Validates** — waits for CI checks via the host API.
 5. **Repairs until mergeable** — if the checks go red or the merge is refused (broken tests, merge conflicts), ralph doesn't give up: it feeds the exact failure back to Claude as a focused repair pass — **rebase onto the updated default branch, fix the cause, re-push** — and retries the merge, up to `merge_repair_attempts` times (default 3). This matters most under parallelism, where conflicts and base-moved-under-you are common.
 6. **Merges** — squash-merges, deletes the source branch, and closes the issue.
-7. **Resets** — removes the worktree (in-place mode: checks out the default branch and fast-forwards), leaving everything clean for the next loop.
+7. **Resets** — removes the worktree (in-place mode: checks out the default branch and fast-forwards), leaving everything clean for the next loop. If the issue **failed**, its commits stay on the `ralph/issue-<N>-<slug>` branch, and re-running the issue **resumes that branch** (rebuilding the worktree from it) instead of starting over — so prior work is never lost.
 
 It does this in three modes:
 
@@ -117,6 +117,13 @@ max_parallel     = 3            # issues `ralph auto` works at once, each in its
 merge_repair_attempts = 3       # times to feed a failed check / refused merge
                                 # back to Claude (rebase, fix, re-push) before
                                 # giving up; 0 disables
+pass_timeout     = ""           # optional wall-clock cap per refine pass, as a
+                                # Go duration (e.g. "45m"); "" = no cap. On a
+                                # timeout the pass is cancelled and retried in
+                                # place (see pass_retries)
+pass_retries     = 2            # retries for a crashed OR timed-out refine pass,
+                                # in place on the same branch, before the issue
+                                # is marked failed (DEFAULT 2); 0 = fail on first
 
 completion_sentinel = "RALPH_GOAL_COMPLETE"  # line Claude emits when goal is done
 

@@ -29,16 +29,26 @@ func CheckoutMain(ctx context.Context, dir, mainBranch string) error {
 	return nil
 }
 
-// CreateWorkBranch creates (or resets) branch and checks it out, off the
-// current HEAD. Uses `git checkout -B` so a re-run of the same issue starts
-// fresh from the just-pulled default branch rather than failing on "branch
-// already exists" or resuming stale local commits — consistent with ralph's
-// fresh-context-per-cycle model. The caller is expected to have checked out and
-// fast-forwarded the default branch first (see CheckoutMain), so the new branch
-// branches from up-to-date upstream.
+// CreateWorkBranch creates a NEW work branch off the current HEAD and checks it
+// out, using `git checkout -B` (which resets it if it somehow already exists).
+// The caller is expected to have checked out and fast-forwarded the default
+// branch first (see CheckoutMain), so the new branch branches from up-to-date
+// upstream. To PRESERVE a prior run's commits on an existing branch, callers
+// check LocalBranchExists first and use CheckoutBranch instead (see
+// makeWorkspace) — mirroring the worktree-mode AddWorktreeResume path.
 func CreateWorkBranch(ctx context.Context, dir, branch string) error {
 	if _, err := run(ctx, dir, "git", "checkout", "-B", branch); err != nil {
 		return fmt.Errorf("create work branch %s: %w", branch, err)
+	}
+	return nil
+}
+
+// CheckoutBranch switches to an existing local branch, restoring its committed
+// state. Unlike CreateWorkBranch it does not reset the branch, so a prior run's
+// commits on it are preserved — the in-place counterpart of AddWorktreeResume.
+func CheckoutBranch(ctx context.Context, dir, branch string) error {
+	if _, err := run(ctx, dir, "git", "checkout", branch); err != nil {
+		return fmt.Errorf("checkout %s: %w", branch, err)
 	}
 	return nil
 }
@@ -78,12 +88,13 @@ func Fetch(ctx context.Context, dir, remote, ref string) error {
 	return nil
 }
 
-// AddWorktree creates an isolated working tree at path for an issue, on branch
-// branch cut from base (typically "origin/<default>"). Like CreateWorkBranch it
-// uses -B so a re-run of the same issue resets the branch to up-to-date upstream
-// rather than failing on "already exists" or resuming stale commits. The repo at
-// repoDir is never checked out or modified — only the new worktree dir is — so a
-// user can keep working in the root checkout while ralph runs here in parallel.
+// AddWorktree creates an isolated working tree at path for an issue, on a fresh
+// branch cut from base (typically "origin/<default>"). It uses -B so it resets
+// the branch to base rather than failing on "already exists"; callers that want
+// to PRESERVE a prior run's commits on an existing branch use AddWorktreeResume
+// instead (see makeWorkspace). The repo at repoDir is never checked out or
+// modified — only the new worktree dir is — so a user can keep working in the
+// root checkout while ralph runs here in parallel.
 func AddWorktree(ctx context.Context, repoDir, path, branch, base string) error {
 	if _, err := run(ctx, repoDir, "git", "worktree", "add", "-B", branch, path, base); err != nil {
 		return fmt.Errorf("worktree add %s (%s off %s): %w", path, branch, base, err)
@@ -91,16 +102,40 @@ func AddWorktree(ctx context.Context, repoDir, path, branch, base string) error 
 	return nil
 }
 
-// RemoveWorktree tears down a worktree created by AddWorktree and prunes the
-// administrative record. Best-effort prune: a failure there is non-fatal. Uses
-// --force because the worktree may hold uncommitted scratch files (e.g. a
-// .ralph/ output dir) that a plain remove would refuse to discard; the branch
-// ref itself survives removal, so already-pushed work is never lost.
-func RemoveWorktree(ctx context.Context, repoDir, path string) error {
-	if _, err := run(ctx, repoDir, "git", "worktree", "remove", "--force", path); err != nil {
-		return fmt.Errorf("worktree remove %s: %w", path, err)
+// AddWorktreeResume checks out an EXISTING branch into a new worktree at path,
+// preserving that branch's commits — unlike AddWorktree, whose -B resets the
+// branch to a base. Used when a prior run for the same issue left commits on the
+// branch and we want to build on them rather than discard them. Fails if branch
+// is already checked out in another worktree.
+func AddWorktreeResume(ctx context.Context, repoDir, path, branch string) error {
+	if _, err := run(ctx, repoDir, "git", "worktree", "add", path, branch); err != nil {
+		return fmt.Errorf("worktree add %s (resume branch %s): %w", path, branch, err)
 	}
+	return nil
+}
+
+// LocalBranchExists reports whether branch exists as a local ref in the repo at
+// dir.
+func LocalBranchExists(ctx context.Context, dir, branch string) bool {
+	_, err := run(ctx, dir, "git", "rev-parse", "--verify", "--quiet", "refs/heads/"+branch)
+	return err == nil
+}
+
+// RemoveWorktree tears down a worktree created by AddWorktree and prunes the
+// administrative record. Uses --force because the worktree may hold uncommitted
+// scratch files (e.g. a .ralph/ output dir) that a plain remove would refuse to
+// discard; the branch ref itself survives removal, so committed work is never
+// lost — a later run can resume the branch (see AddWorktreeResume).
+//
+// The prune runs UNCONDITIONALLY, even when `remove` fails (e.g. the directory
+// was already deleted by a crashed run): otherwise a stale registration lingers
+// and would block re-adding the same branch with "already checked out".
+func RemoveWorktree(ctx context.Context, repoDir, path string) error {
+	_, removeErr := run(ctx, repoDir, "git", "worktree", "remove", "--force", path)
 	_, _ = run(ctx, repoDir, "git", "worktree", "prune")
+	if removeErr != nil {
+		return fmt.Errorf("worktree remove %s: %w", path, removeErr)
+	}
 	return nil
 }
 

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/chuntley/go-ralph-go/internal/config"
 	"github.com/chuntley/go-ralph-go/internal/runner"
@@ -13,6 +14,8 @@ func newIssueCmd() *cobra.Command {
 	var iterations int
 	var instructionsDoc string
 	var noWorktree bool
+	var passTimeout time.Duration
+	var passRetries int
 
 	cmd := &cobra.Command{
 		Use:   "issue <number>",
@@ -27,7 +30,7 @@ func newIssueCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("load config: %w", err)
 			}
-			if err := applyOverrides(cfg, minIterations, iterations, instructionsDoc); err != nil {
+			if err := applyOverrides(cfg, minIterations, iterations, instructionsDoc, passTimeout, passRetries); err != nil {
 				return err
 			}
 			if noWorktree {
@@ -44,5 +47,7 @@ func newIssueCmd() *cobra.Command {
 	cmd.Flags().IntVarP(&iterations, "iterations", "n", 0, "override the max refine passes safety cap")
 	cmd.Flags().StringVar(&instructionsDoc, "instructions-doc", "", "override the doc Claude follows during cleanup")
 	cmd.Flags().BoolVar(&noWorktree, "no-worktree", false, "disable worktree isolation; work in-place in the repo root (requires a clean tree)")
+	cmd.Flags().DurationVar(&passTimeout, "pass-timeout", 0, "cap each refine pass (e.g. 45m); 0 = no cap. On timeout the pass is retried in place")
+	cmd.Flags().IntVar(&passRetries, "pass-retries", -1, "retries for a crashed/timed-out pass, in place on the same worktree (default from config; 0 = fail on first)")
 	return cmd
 }
